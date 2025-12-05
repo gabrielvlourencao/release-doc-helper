@@ -69,7 +69,7 @@ import { ReleaseService } from '../../core';
             </div>
           </div>
 
-          <div class="card p-6">
+          <div class="card p-6 cursor-pointer hover:border-primary-300 transition-colors" (click)="scrollToHowToUse()">
             <div class="flex items-center gap-4">
               <div class="w-12 h-12 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -78,7 +78,189 @@ import { ReleaseService } from '../../core';
               </div>
               <div>
                 <p class="text-lg font-semibold text-slate-900">Como usar</p>
-                <p class="text-sm text-slate-500">Crie → Edite → Versione</p>
+                <p class="text-sm text-slate-500">Entenda o processo</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Como Usar - Seção Detalhada -->
+      <section id="how-to-use" class="mb-8">
+        <div class="card overflow-hidden">
+          <!-- Header -->
+          <div class="bg-gradient-to-r from-amber-50 to-orange-50 border-b border-amber-100 px-6 py-4">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/>
+                </svg>
+              </div>
+              <div>
+                <h2 class="text-xl font-bold text-slate-900">Por que usar Documentos de Release?</h2>
+                <p class="text-sm text-slate-600">Padronização e rastreabilidade em entregas</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="p-6">
+            <!-- Motivo / Propósito -->
+            <div class="mb-8">
+              <h3 class="text-lg font-semibold text-slate-800 mb-3 flex items-center gap-2">
+                <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                Objetivo
+              </h3>
+              <div class="bg-slate-50 rounded-xl p-4 border border-slate-200">
+                <p class="text-slate-700 leading-relaxed mb-3">
+                  O <strong>Documento de Release</strong> serve para <strong>padronizar e documentar</strong> todas as informações necessárias para uma entrega em produção, garantindo:
+                </p>
+                <ul class="space-y-2 text-slate-600">
+                  <li class="flex items-start gap-2">
+                    <svg class="w-5 h-5 text-emerald-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                    <span><strong>Rastreabilidade:</strong> Histórico de todas as releases em cada repositório</span>
+                  </li>
+                  <li class="flex items-start gap-2">
+                    <svg class="w-5 h-5 text-emerald-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                    <span><strong>Responsabilidades:</strong> Quem são os responsáveis (Dev, Funcional, LT, SRE)</span>
+                  </li>
+                  <li class="flex items-start gap-2">
+                    <svg class="w-5 h-5 text-emerald-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                    <span><strong>Dependências:</strong> Keys, secrets e scripts necessários para deploy</span>
+                  </li>
+                  <li class="flex items-start gap-2">
+                    <svg class="w-5 h-5 text-emerald-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                    <span><strong>Comunicação:</strong> Documentação centralizada para todos os envolvidos</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- Fluxo de Trabalho -->
+            <div class="mb-8">
+              <h3 class="text-lg font-semibold text-slate-800 mb-3 flex items-center gap-2">
+                <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                </svg>
+                Fluxo de Trabalho
+              </h3>
+              <div class="grid md:grid-cols-3 gap-4">
+                <div class="bg-primary-50 rounded-xl p-4 border border-primary-100 text-center">
+                  <div class="w-10 h-10 bg-primary-500 text-white rounded-full flex items-center justify-center mx-auto mb-3 text-lg font-bold">1</div>
+                  <h4 class="font-semibold text-primary-900 mb-1">Criar Documento</h4>
+                  <p class="text-sm text-primary-700">Preencha os dados da release: demanda, responsáveis, secrets, scripts e repositórios impactados</p>
+                </div>
+                <div class="bg-emerald-50 rounded-xl p-4 border border-emerald-100 text-center">
+                  <div class="w-10 h-10 bg-emerald-500 text-white rounded-full flex items-center justify-center mx-auto mb-3 text-lg font-bold">2</div>
+                  <h4 class="font-semibold text-emerald-900 mb-1">Revisar e Editar</h4>
+                  <p class="text-sm text-emerald-700">Exporte como PDF/MD para revisão. Ajuste conforme necessário antes de versionar</p>
+                </div>
+                <div class="bg-amber-50 rounded-xl p-4 border border-amber-100 text-center">
+                  <div class="w-10 h-10 bg-amber-500 text-white rounded-full flex items-center justify-center mx-auto mb-3 text-lg font-bold">3</div>
+                  <h4 class="font-semibold text-amber-900 mb-1">Versionar</h4>
+                  <p class="text-sm text-amber-700">Clique em "Versionar" para criar automaticamente os arquivos e abrir PRs nos repositórios</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Estrutura no Repositório -->
+            <div class="mb-6">
+              <h3 class="text-lg font-semibold text-slate-800 mb-3 flex items-center gap-2">
+                <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                </svg>
+                Estrutura no Repositório
+              </h3>
+              <p class="text-slate-600 mb-4">Quando você versiona um documento, a seguinte estrutura é criada automaticamente no repositório:</p>
+              
+              <div class="bg-slate-900 rounded-xl p-5 text-sm font-mono overflow-x-auto">
+                <div class="text-slate-300">
+                  <div class="text-slate-500 mb-2"># Estrutura do repositório após versionamento</div>
+                  <div class="flex items-center gap-2 text-slate-400">
+                    <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.463-1.11-1.463-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.167 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
+                    <span>meu-repositorio/</span>
+                  </div>
+                  <div class="ml-6 mt-1">
+                    <div class="text-slate-400">├── src/</div>
+                    <div class="text-slate-400">├── ...</div>
+                    <div class="text-amber-400 font-semibold">├── releases/</div>
+                    <div class="ml-6">
+                      <div class="text-emerald-400">│   ├── release_DEM-1234.md</div>
+                      <div class="text-emerald-400">│   ├── release_DEM-1235.md</div>
+                      <div class="text-slate-500">│   └── ...</div>
+                    </div>
+                    <div class="text-amber-400 font-semibold">├── scripts/</div>
+                    <div class="ml-6">
+                      <div class="text-slate-400">│   ├── DEM-1234/</div>
+                      <div class="ml-6">
+                        <div class="text-cyan-400">│   │   ├── migrate_db.sql</div>
+                        <div class="text-cyan-400">│   │   └── update_config.sh</div>
+                      </div>
+                      <div class="text-slate-400">│   └── DEM-1235/</div>
+                      <div class="ml-6">
+                        <div class="text-cyan-400">│       └── seed_data.sql</div>
+                      </div>
+                    </div>
+                    <div class="text-slate-400">└── README.md</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Exemplo de Conteúdo -->
+            <div>
+              <h3 class="text-lg font-semibold text-slate-800 mb-3 flex items-center gap-2">
+                <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                Exemplo: release_DEM-1234.md
+              </h3>
+              
+              <div class="bg-slate-900 rounded-xl p-5 text-sm font-mono overflow-x-auto max-h-80">
+                <pre class="text-slate-300 whitespace-pre-wrap"><span class="text-cyan-400"># Release DEM-1234</span>
+
+<span class="text-amber-400">**Implementação do módulo de pagamentos**</span>
+
+<span class="text-cyan-400">## 1. Responsáveis</span>
+| Função    | Nome          |
+|-----------|---------------|
+| Dev       | João Silva    |
+| Funcional | Maria Santos  |
+| LT        | Carlos Lima   |
+| SRE       | Ana Costa     |
+
+<span class="text-cyan-400">## 2. Descrição da Release</span>
+> Implementação do novo módulo de pagamentos com integração 
+> ao gateway de pagamentos e suporte a PIX.
+
+<span class="text-cyan-400">## 3. Keys ou Secrets Necessárias</span>
+| Ambiente | Key/Secret           | Descrição           | Status     |
+|----------|----------------------|---------------------|------------|
+| PROD     | PAYMENT_API_KEY      | Chave do gateway    | PENDING    |
+| PROD     | PIX_CERTIFICATE      | Certificado PIX     | CONFIGURED |
+
+<span class="text-cyan-400">## 4. Scripts Necessários</span>
+| Script          | Caminho                              | CHG       |
+|-----------------|--------------------------------------|-----------|
+| migrate_db.sql  | scripts/DEM-1234/migrate_db.sql     | CHG-9876  |
+
+<span class="text-cyan-400">## 5. Projetos Impactados (Repositórios)</span>
+| Repositório                     | Impacto            | Branch    |
+|---------------------------------|--------------------|-----------|
+| org/payment-service             | Novo módulo        | develop   |
+| org/api-gateway                 | Nova rota          | develop   |
+
+---
+<span class="text-slate-500">*Documento gerado em 05/12/2024 às 14:30*</span></pre>
               </div>
             </div>
           </div>
@@ -178,5 +360,12 @@ export class HomeComponent implements OnInit, OnDestroy {
 
   openRelease(release: Release): void {
     this.router.navigate(['/releases', release.id]);
+  }
+
+  scrollToHowToUse(): void {
+    const element = document.getElementById('how-to-use');
+    if (element) {
+      element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
   }
 }

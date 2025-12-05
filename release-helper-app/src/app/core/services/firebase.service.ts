@@ -8,20 +8,29 @@ import { environment } from '../../../environments/environment';
   providedIn: 'root'
 })
 export class FirebaseService {
-  private app: FirebaseApp;
+  private app!: FirebaseApp;
   private analytics: Analytics | null = null;
-  private firestore: Firestore;
+  private firestore!: Firestore;
 
   constructor() {
-    // Inicializa o Firebase App
-    this.app = initializeApp(environment.firebase);
-    
-    // Inicializa o Firestore
-    this.firestore = getFirestore(this.app);
-    
-    // Inicializa o Analytics apenas no browser (não em SSR)
-    if (typeof window !== 'undefined') {
-      this.analytics = getAnalytics(this.app);
+    try {
+      // Inicializa o Firebase App
+      this.app = initializeApp(environment.firebase);
+      
+      // Inicializa o Firestore (lazy)
+      this.firestore = getFirestore(this.app);
+      
+      // Inicializa o Analytics apenas no browser e de forma não bloqueante
+      if (typeof window !== 'undefined') {
+        try {
+          this.analytics = getAnalytics(this.app);
+        } catch (error) {
+          console.warn('Firebase Analytics não pôde ser inicializado:', error);
+        }
+      }
+    } catch (error) {
+      console.error('Erro ao inicializar Firebase:', error);
+      // Continua mesmo se o Firebase falhar
     }
   }
 

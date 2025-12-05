@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
-import { BehaviorSubject, Observable, of } from 'rxjs';
-import { map, delay } from 'rxjs/operators';
+import { BehaviorSubject, Observable, of, forkJoin } from 'rxjs';
+import { map, delay, switchMap, catchError, tap } from 'rxjs/operators';
 import {
   Release,
   ReleaseResponsible,
@@ -12,6 +12,15 @@ import {
   VersioningResult,
   VersionedFile
 } from '../../models';
+
+export interface GitHubReleaseFile {
+  repo: string;
+  owner: string;
+  repoName: string;
+  name: string;
+  path: string;
+  sha: string;
+}
 
 /**
  * Serviço para gerenciamento de Releases
@@ -350,5 +359,142 @@ export class ReleaseService {
       impact: '',
       releaseBranch: ''
     };
+  }
+
+  /**
+   * Faz parse de um markdown de release para objeto Release
+   */
+  parseMarkdownToRelease(markdown: string, fileName: string, repoFullName: string): Partial<Release> {
+    const lines = markdown.split('\n');
+    
+    // Extrai demandId do nome do arquivo (release_XXXX.md)
+    const demandIdMatch = fileName.match(/release_(.+)\.md$/);
+    const demandId = demandIdMatch ? demandIdMatch[1] : fileName.replace('.md', '');
+    
+    // Extrai título
+    let title = '';
+    let description = '';
+    const responsible: ReleaseResponsible = { dev: '', functional: '', lt: '', sre: '' };
+    const secrets: ReleaseSecret[] = [];
+    const scripts: ReleaseScript[] = [];
+    const repositories: ReleaseRepository[] = [];
+    let observations = '';
+
+    let currentSection = '';
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      
+      // Detecta seções
+      if (line.startsWith('## 1.') || line.toLowerCase().includes('responsáveis')) {
+        currentSection = 'responsible';
+        continue;
+      }
+      if (line.startsWith('## 2.') || line.toLowerCase().includes('descrição')) {
+        currentSection = 'description';
+        continue;
+      }
+      if (line.startsWith('## 3.') || line.toLowerCase().includes('keys') || line.toLowerCase().includes('secrets')) {
+        currentSection = 'secrets';
+        continue;
+      }
+      if (line.startsWith('## 4.') || line.toLowerCase().includes('scripts')) {
+        currentSection = 'scripts';
+        continue;
+      }
+      if (line.startsWith('## 5.') || line.toLowerCase().includes('repositórios') || line.toLowerCase().includes('projetos')) {
+        currentSection = 'repositories';
+        continue;
+      }
+      if (line.startsWith('## 6.') || line.toLowerCase().includes('observações')) {
+        currentSection = 'observations';
+        continue;
+      }
+      
+      // Extrai título (linha com **)
+      if (line.startsWith('**') && line.endsWith('**') && !title) {
+        title = line.replace(/\*\*/g, '');
+        continue;
+      }
+      
+      // Processa seções
+      if (currentSection === 'description' && line.startsWith('>')) {
+        description = line.replace(/^>\s*/, '');
+      }
+      
+      if (currentSection === 'responsible' && line.startsWith('|') && !line.includes('Função')) {
+        const parts = line.split('|').map(p => p.trim()).filter(p => p);
+        if (parts.length >= 2) {
+          const role = parts[0].toLowerCase();
+          const name = parts[1];
+          if (role.includes('dev')) responsible.dev = name;
+          if (role.includes('funcional')) responsible.functional = name;
+          if (role.includes('lt')) responsible.lt = name;
+          if (role.includes('sre')) responsible.sre = name;
+        }
+      }
+      
+      if (currentSection === 'observations' && line && !line.startsWith('#') && !line.startsWith('---')) {
+        observations += (observations ? '\n' : '') + line;
+      }
+    }
+
+    // Adiciona o repo de origem
+    repositories.push({
+      id: `repo-${Date.now()}`,
+      url: `https://github.com/${repoFullName}`,
+      name: repoFullName,
+      impact: 'Origem do documento',
+      releaseBranch: 'develop'
+    });
+
+    return {
+      demandId,
+      title: title || demandId,
+      description,
+      responsible,
+      secrets,
+      scripts,
+      repositories,
+      observations
+    };
+  }
+
+  /**
+   * Cria/atualiza release a partir de dados do GitHub
+   */
+  createOrUpdateFromGitHub(releaseData: Partial<Release>, sourceRepo: string, sourcePath: string): Observable<Release> {
+    // Verifica se já existe uma release com esse demandId
+    const existing = this.releasesSubject.value.find(
+      r => r.demandId.toLowerCase() === releaseData.demandId?.toLowerCase()
+    );
+
+    if (existing) {
+      // Atualiza
+      return this.update(existing.id, {
+        ...releaseData,
+        // Preserva campos que podem ter sido editados localmente
+        updatedAt: new Date()
+      }).pipe(map(r => r!));
+    } else {
+      // Cria nova
+      const newRelease: Release = {
+        id: this.generateId(),
+        demandId: releaseData.demandId || '',
+        title: releaseData.title || '',
+        description: releaseData.description || '',
+        responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
+        secrets: releaseData.secrets || [],
+        scripts: releaseData.scripts || [],
+        repositories: releaseData.repositories || [],
+        observations: releaseData.observations || '',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const releases = [...this.releasesSubject.value, newRelease];
+      this.saveToStorage(releases);
+      return of(newRelease);
+    }
   }
 }
