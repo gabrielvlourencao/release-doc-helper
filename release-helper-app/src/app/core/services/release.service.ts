@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
-import { BehaviorSubject, Observable, of, forkJoin, combineLatest } from 'rxjs';
-import { map, delay, switchMap, catchError, tap } from 'rxjs/operators';
+import { Observable, of, forkJoin } from 'rxjs';
+import { map, switchMap, catchError, take } from 'rxjs/operators';
+import { throwError } from 'rxjs';
 import {
   Release,
   ReleaseResponsible,
@@ -28,111 +29,21 @@ export interface GitHubReleaseFile {
 /**
  * Serviço para gerenciamento de Releases
  * 
- * Combina:
- * - localStorage: releases locais (criadas pelo usuário, ainda não versionadas)
- * - Firestore: releases compartilhadas (sincronizadas do GitHub após merge do PR)
- * 
- * IMPORTANTE: Releases criadas localmente ficam apenas no localStorage até fazer merge do PR.
- * Após sincronizar com GitHub, elas aparecem no Firestore para todos visualizarem.
+ * Usa apenas Firestore para armazenamento, permitindo edição colaborativa
+ * entre múltiplos usuários antes de versionar no GitHub.
  */
 @Injectable({
   providedIn: 'root'
 })
 export class ReleaseService {
-  private readonly STORAGE_KEY = 'release_documents';
-  private localReleasesSubject = new BehaviorSubject<Release[]>([]);
-  private combinedReleasesSubject = new BehaviorSubject<Release[]>([]);
-  
-  // Observable apenas de releases locais
-  localReleases$ = this.localReleasesSubject.asObservable();
-  
-  // Observable combinado (locais + compartilhadas do Firestore)
-  releases$ = this.combinedReleasesSubject.asObservable();
+  // Observable de releases do Firestore
+  releases$ = this.firestoreReleaseService.getAll();
 
   constructor(
     private firestoreReleaseService: FirestoreReleaseService,
     private authService: GitHubAuthService,
     private githubService: GitHubService
-  ) {
-    this.loadFromStorage();
-    this.combineReleases();
-  }
-
-  /**
-   * Carrega releases do localStorage (apenas releases locais)
-   */
-  private loadFromStorage(): void {
-    try {
-      const stored = localStorage.getItem(this.STORAGE_KEY);
-      if (stored) {
-        const releases = JSON.parse(stored) as Release[];
-        releases.forEach(r => {
-          r.createdAt = new Date(r.createdAt);
-          r.updatedAt = new Date(r.updatedAt);
-        });
-        this.localReleasesSubject.next(releases);
-      }
-    } catch (error) {
-      console.error('Erro ao carregar releases do storage:', error);
-      this.localReleasesSubject.next([]);
-    }
-  }
-
-  /**
-   * Salva releases no localStorage (apenas releases locais)
-   */
-  private saveToStorage(releases: Release[]): void {
-    try {
-      localStorage.setItem(this.STORAGE_KEY, JSON.stringify(releases));
-      this.localReleasesSubject.next(releases);
-    } catch (error) {
-      console.error('Erro ao salvar releases no storage:', error);
-    }
-  }
-
-  /**
-   * Combina releases locais (localStorage) com compartilhadas (Firestore)
-   * Prioriza releases do Firestore se houver duplicata (mesmo demandId)
-   */
-  private combineReleases(): void {
-    combineLatest([
-      this.localReleases$,
-      this.firestoreReleaseService.getAll()
-    ]).pipe(
-      map(([localReleases, sharedReleases]) => {
-        // Cria mapa de releases compartilhadas por demandId
-        const sharedMap = new Map<string, Release>();
-        sharedReleases.forEach(r => {
-          sharedMap.set(r.demandId.toUpperCase(), r);
-        });
-
-        // Combina releases, priorizando compartilhadas
-        const combined: Release[] = [];
-        const seenDemandIds = new Set<string>();
-
-        // Primeiro adiciona compartilhadas
-        sharedReleases.forEach(r => {
-          combined.push(r);
-          seenDemandIds.add(r.demandId.toUpperCase());
-        });
-
-        // Depois adiciona locais que não estão no Firestore
-        localReleases.forEach(r => {
-          if (!seenDemandIds.has(r.demandId.toUpperCase())) {
-            combined.push(r);
-            seenDemandIds.add(r.demandId.toUpperCase());
-          }
-        });
-
-        // Ordena por data de atualização (mais recente primeiro)
-        return combined.sort((a, b) => 
-          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-        );
-      })
-    ).subscribe(combined => {
-      this.combinedReleasesSubject.next(combined);
-    });
-  }
+  ) {}
 
   /**
    * Gera ID único
@@ -204,10 +115,9 @@ export class ReleaseService {
   }
 
   /**
-   * Cria nova release e sincroniza no Firestore para permitir edição colaborativa
-   * A release também é salva no localStorage para backup local
+   * Cria nova release e salva no Firestore para permitir edição colaborativa
    */
-  create(release: Omit<Release, 'id' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy'>): Observable<Release> {
+  create(release: Omit<Release, 'id' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'isVersioned'>): Observable<Release> {
     const currentUser = this.getCurrentUserLogin();
     const newRelease: Release = {
       ...release,
@@ -215,110 +125,71 @@ export class ReleaseService {
       createdAt: new Date(),
       updatedAt: new Date(),
       createdBy: currentUser,
-      updatedBy: currentUser
+      updatedBy: currentUser,
+      isVersioned: false // Nova release sempre começa como não versionada
     };
 
-    // Salva no localStorage (backup local)
-    const localReleases = [...this.localReleasesSubject.value, newRelease];
-    this.saveToStorage(localReleases);
-
-    // Sincroniza no Firestore para permitir edição colaborativa
+    // Salva no Firestore
     return this.firestoreReleaseService.syncRelease(newRelease).pipe(
       map(() => newRelease),
       catchError(error => {
-        console.error('Erro ao sincronizar release no Firestore:', error);
-        // Continua mesmo se der erro no Firestore
-        return of(newRelease);
-      }),
-      delay(300)
+        console.error('Erro ao criar release no Firestore:', error);
+        return throwError(() => error);
+      })
     );
   }
 
   /**
-   * Atualiza release existente e sincroniza no Firestore
+   * Atualiza release existente no Firestore
    * Permite edição colaborativa antes de versionar
+   * Quando uma release é editada, ela é marcada como não versionada
    */
   update(id: string, changes: Partial<Release>): Observable<Release | null> {
-    const localReleases = this.localReleasesSubject.value;
-    const index = localReleases.findIndex(r => r.id === id);
+    // Busca a release no Firestore
+    return this.releases$.pipe(
+      take(1),
+      switchMap(releases => {
+        const release = releases.find(r => r.id === id);
+        
+        if (!release) {
+          console.warn('Release não encontrada para edição');
+          return of(null);
+        }
 
-    if (index === -1) {
-      // Tenta buscar no Firestore
-      return this.firestoreReleaseService.getByDemandId(
-        changes.demandId || ''
-      ).pipe(
-        switchMap(firestoreRelease => {
-          if (!firestoreRelease || firestoreRelease.id !== id) {
-            console.warn('Release não encontrada para edição');
-            return of(null);
-          }
+        const currentUser = this.getCurrentUserLogin();
+        const updatedRelease: Release = {
+          ...release,
+          ...changes,
+          id,
+          updatedAt: new Date(),
+          updatedBy: currentUser || release.updatedBy,
+          // Marca como não versionada quando editada (a menos que explicitamente seja definido como versionada)
+          isVersioned: changes.isVersioned !== undefined ? changes.isVersioned : false
+        };
 
-          const currentUser = this.getCurrentUserLogin();
-          const updatedRelease: Release = {
-            ...firestoreRelease,
-            ...changes,
-            id,
-            updatedAt: new Date(),
-            updatedBy: currentUser || firestoreRelease.updatedBy
-          };
-
-          // Atualiza no Firestore
-          return this.firestoreReleaseService.syncRelease(updatedRelease).pipe(
-            map(() => updatedRelease),
-            catchError(error => {
-              console.error('Erro ao atualizar release no Firestore:', error);
-              return of(updatedRelease);
-            })
-          );
-        })
-      );
-    }
-
-    const currentUser = this.getCurrentUserLogin();
-    const updatedRelease: Release = {
-      ...localReleases[index],
-      ...changes,
-      id,
-      updatedAt: new Date(),
-      updatedBy: currentUser || localReleases[index].updatedBy
-    };
-
-    // Atualiza no localStorage
-    const updatedReleases = [
-      ...localReleases.slice(0, index),
-      updatedRelease,
-      ...localReleases.slice(index + 1)
-    ];
-    this.saveToStorage(updatedReleases);
-
-    // Sincroniza no Firestore
-    return this.firestoreReleaseService.syncRelease(updatedRelease).pipe(
-      map(() => updatedRelease),
-      catchError(error => {
-        console.error('Erro ao sincronizar release no Firestore:', error);
-        return of(updatedRelease);
-      }),
-      delay(300)
+        // Atualiza no Firestore
+        return this.firestoreReleaseService.syncRelease(updatedRelease).pipe(
+          map(() => updatedRelease),
+          catchError(error => {
+            console.error('Erro ao atualizar release no Firestore:', error);
+            return throwError(() => error);
+          })
+        );
+      })
     );
   }
 
   /**
-   * Remove release (apenas releases locais)
-   * Releases compartilhadas não podem ser deletadas (só via GitHub)
+   * Remove release do Firestore
    */
   delete(id: string): Observable<boolean> {
-    const localReleases = this.localReleasesSubject.value;
-    const index = localReleases.findIndex(r => r.id === id);
-
-    if (index === -1) {
-      // Release não encontrada localmente, pode ser compartilhada
-      console.warn('Release compartilhada não pode ser deletada diretamente. Delete no GitHub.');
-      return of(false);
-    }
-
-    const filtered = localReleases.filter(r => r.id !== id);
-    this.saveToStorage(filtered);
-    return of(true).pipe(delay(300));
+    return this.firestoreReleaseService.deleteRelease(id).pipe(
+      map(() => true),
+      catchError(error => {
+        console.error('Erro ao deletar release do Firestore:', error);
+        return of(false);
+      })
+    );
   }
 
   /**
@@ -447,7 +318,7 @@ export class ReleaseService {
   /**
    * Cria release vazia para formulário
    */
-  createEmptyRelease(): Omit<Release, 'id' | 'createdAt' | 'updatedAt'> {
+  createEmptyRelease(): Omit<Release, 'id' | 'createdAt' | 'updatedAt' | 'isVersioned'> {
     return {
       demandId: '',
       title: '',
@@ -602,50 +473,49 @@ export class ReleaseService {
 
   /**
    * Cria/atualiza release a partir de dados do GitHub
-   * Este método é usado para importar releases do GitHub para o localStorage local.
-   * 
-   * NOTA: createdBy/updatedBy só são preservados se vierem do releaseData (do Firestore).
-   * Não define automaticamente pois isso só acontece na sincronização real (SyncService).
+   * Este método é usado pelo SyncService para sincronizar releases do GitHub para o Firestore.
+   * Releases sincronizadas do GitHub são marcadas como versionadas
    */
   createOrUpdateFromGitHub(releaseData: Partial<Release>, sourceRepo: string, sourcePath: string): Observable<Release> {
-    // Verifica se já existe uma release com esse demandId (apenas nas locais)
-    const existing = this.localReleasesSubject.value.find(
-      (r: Release) => r.demandId.toLowerCase() === releaseData.demandId?.toLowerCase()
+    // Verifica se já existe uma release com esse demandId no Firestore
+    return this.firestoreReleaseService.getByDemandId(releaseData.demandId || '').pipe(
+      take(1),
+      switchMap(existing => {
+        if (existing) {
+          // Atualiza, preservando createdBy/updatedBy se vierem do releaseData
+          // Mas marca como versionada porque veio do GitHub
+          return this.update(existing.id, {
+            ...releaseData,
+            updatedAt: new Date(),
+            createdBy: releaseData.createdBy || existing.createdBy,
+            updatedBy: releaseData.updatedBy || existing.updatedBy,
+            isVersioned: true // Releases do GitHub são versionadas
+          }).pipe(map(r => r!));
+        } else {
+          // Cria nova, preservando createdBy/updatedBy se vierem do releaseData
+          const newRelease: Release = {
+            id: this.generateId(),
+            demandId: releaseData.demandId || '',
+            title: releaseData.title || '',
+            description: releaseData.description || '',
+            responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
+            secrets: releaseData.secrets || [],
+            scripts: releaseData.scripts || [],
+            repositories: releaseData.repositories || [],
+            observations: releaseData.observations || '',
+            createdAt: releaseData.createdAt || new Date(),
+            updatedAt: new Date(),
+            createdBy: releaseData.createdBy,
+            updatedBy: releaseData.updatedBy,
+            isVersioned: true // Releases do GitHub são versionadas
+          };
+
+          return this.firestoreReleaseService.syncRelease(newRelease).pipe(
+            map(() => newRelease)
+          );
+        }
+      })
     );
-
-    if (existing) {
-      // Atualiza, preservando createdBy/updatedBy se vierem do releaseData (do Firestore)
-      return this.update(existing.id, {
-        ...releaseData,
-        // Preserva campos que podem ter sido editados localmente
-        updatedAt: new Date(),
-        // Preserva createdBy/updatedBy apenas se vierem do releaseData (já sincronizado)
-        createdBy: releaseData.createdBy || existing.createdBy,
-        updatedBy: releaseData.updatedBy || existing.updatedBy
-      }).pipe(map(r => r!));
-    } else {
-      // Cria nova, preservando createdBy/updatedBy apenas se vierem do releaseData (do Firestore)
-      const newRelease: Release = {
-        id: this.generateId(),
-        demandId: releaseData.demandId || '',
-        title: releaseData.title || '',
-        description: releaseData.description || '',
-        responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
-        secrets: releaseData.secrets || [],
-        scripts: releaseData.scripts || [],
-        repositories: releaseData.repositories || [],
-        observations: releaseData.observations || '',
-        createdAt: releaseData.createdAt || new Date(),
-        updatedAt: new Date(),
-        // Preserva createdBy/updatedBy apenas se vierem do releaseData (já sincronizado)
-        createdBy: releaseData.createdBy,
-        updatedBy: releaseData.updatedBy
-      };
-
-      const releases = [...this.localReleasesSubject.value, newRelease];
-      this.saveToStorage(releases);
-      return of(newRelease);
-    }
   }
 
   /**

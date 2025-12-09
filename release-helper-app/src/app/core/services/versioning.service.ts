@@ -137,6 +137,13 @@ export class VersioningService {
         if (results.errors && results.errors.length > selectedRepos.length / 2) {
           results.success = false;
         }
+        // Se o versionamento foi bem-sucedido (pelo menos um PR criado), marca como versionada
+        if (results.success && results.prs && results.prs.length > 0) {
+          // Atualiza a release no Firestore marcando como versionada
+          this.releaseService.update(release.id, { isVersioned: true }).subscribe({
+            error: (err) => console.error('Erro ao atualizar status de versionamento:', err)
+          });
+        }
         return results;
       }),
       catchError(() => {
@@ -184,7 +191,6 @@ export class VersioningService {
         switchMap((sha: string | null) => {
           if (!sha) {
             // Arquivo não existe neste repositório, pula
-            console.log(`[deleteReleaseFromGitHub] Arquivo não existe em ${owner}/${repoName}, pulando...`);
             return of({ repo: repoName, success: true, pr: null });
           }
 

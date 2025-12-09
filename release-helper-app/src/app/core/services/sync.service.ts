@@ -50,7 +50,6 @@ export class SyncService {
         // Se não encontrou nenhuma release, não remove nada do Firestore
         // Pode ser que o usuário não tenha acesso aos repositórios
         if (reposWithReleases.length === 0) {
-          console.log('[SyncService] Nenhuma release encontrada no GitHub (pode ser falta de acesso aos repositórios)');
           this.notificationService.info('Nenhuma release encontrada nos repositórios acessíveis. Verifique se você tem acesso aos repositórios das organizações.');
           return of({ synced: 0, removed: 0, errors: [] });
         }
@@ -67,8 +66,6 @@ export class SyncService {
             });
           });
         });
-
-        console.log(`[SyncService] Encontrados ${allReleaseFiles.length} arquivos de release para processar (apenas de organizações)`);
 
         // Processa cada arquivo
         // Nota: getUserRepositories() já filtra apenas repositórios de organizações,
@@ -107,6 +104,7 @@ export class SyncService {
                 take(1),
                 switchMap(existingRelease => {
                   // Cria objeto Release completo
+                  // Releases sincronizadas do GitHub são sempre versionadas
                   const release: Release = {
                     id: releaseId,
                     demandId: releaseData.demandId || '',
@@ -120,8 +118,10 @@ export class SyncService {
                     createdAt: existingRelease?.createdAt || new Date(),
                     updatedAt: new Date(),
                     createdBy: existingRelease?.createdBy || currentUser,
-                    updatedBy: currentUser
+                    updatedBy: currentUser,
+                    isVersioned: true // Releases do GitHub são sempre versionadas
                   };
+
 
                   // Sincroniza no Firestore
                   return this.firestoreReleaseService.syncRelease(release).pipe(
@@ -158,8 +158,6 @@ export class SyncService {
               }
             });
 
-            console.log(`[SyncService] Releases sincronizadas: ${syncedDemandIds.size}`);
-            console.log(`[SyncService] DemandIds sincronizados:`, Array.from(syncedDemandIds));
 
             // Só remove do Firestore se não houver erros críticos
             // Erros críticos = mais de 50% das operações falharam
@@ -177,12 +175,18 @@ export class SyncService {
                 // Para cada release no Firestore que não foi encontrada na sincronização,
                 // verifica diretamente no GitHub se o arquivo ainda existe
                 // Isso evita remover releases de repositórios que o usuário não tem acesso
+                // IMPORTANTE: Releases não versionadas (isVersioned === false) NUNCA são removidas
                 const releasesToCheck = firestoreReleases.filter(firestoreRelease => {
                   const demandId = firestoreRelease.demandId.toUpperCase();
-                  return !syncedDemandIds.has(demandId);
+                  const notFoundInSync = !syncedDemandIds.has(demandId);
+                  const isVersioned = firestoreRelease.isVersioned ?? false;
+                  
+                  // Só verifica se deve remover se:
+                  // 1. Não foi encontrada na sincronização E
+                  // 2. Está marcada como versionada (releases não versionadas são sempre preservadas)
+                  return notFoundInSync && isVersioned;
                 });
 
-                console.log(`[SyncService] Verificando ${releasesToCheck.length} release(s) que não foram encontradas na sincronização...`);
 
                 if (releasesToCheck.length === 0) {
                   return of({ synced, removed: 0, errors });
@@ -236,7 +240,6 @@ export class SyncService {
                       .filter(result => result.shouldRemove)
                       .map(result => result.release);
 
-                    console.log(`[SyncService] ${releasesToRemove.length} release(s) confirmadas como inexistentes no GitHub`);
 
                     if (releasesToRemove.length === 0) {
                       return of({ synced, removed: 0, errors });
@@ -256,7 +259,6 @@ export class SyncService {
                     return forkJoin(deleteOperations).pipe(
                       map(deleteResults => {
                         const removed = deleteResults.filter(r => r.success).length;
-                        console.log(`[SyncService] ${removed} release(s) removida(s) do Firestore`);
 
                         if (synced > 0) {
                           this.notificationService.success(

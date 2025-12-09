@@ -16,6 +16,7 @@ export interface Release {
   updatedAt: Date;
   createdBy?: string; // Login do usuário que criou (ex: GitHub login)
   updatedBy?: string; // Login do usuário que fez a última atualização
+  isVersioned?: boolean; // Indica se a release foi versionada no GitHub
 }
 
 /**

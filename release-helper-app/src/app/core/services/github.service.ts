@@ -130,12 +130,7 @@ export class GitHubService {
 
     // Busca APENAS repositórios de organizações (ignora pessoais)
     return from(this.fetchOrganizationRepositories(octokit)).pipe(
-      map(repos => {
-        console.log(`[getUserRepositories] Total de repositórios de organizações encontrados: ${repos.length}`);
-        // Lista todos os nomes para debug
-        repos.forEach(r => console.log(`  - ${r.full_name} (${r.owner.type})`));
-        return repos;
-      }),
+      map(repos => repos),
       catchError(error => {
         console.error('Erro ao listar repositórios:', error);
         return throwError(() => error);
@@ -153,25 +148,19 @@ export class GitHubService {
 
     try {
       // 1. Busca organizações do usuário
-      console.log('[fetchOrganizationRepositories] Buscando organizações...');
       const orgs = await octokit.paginate(octokit.orgs.listForAuthenticatedUser, {
         per_page: 100
       });
-      console.log(`[fetchOrganizationRepositories] Organizações encontradas: ${orgs.length}`);
-      orgs.forEach(o => console.log(`  - Org: ${o.login}`));
 
       if (orgs.length === 0) {
-        console.log('[fetchOrganizationRepositories] Nenhuma organização encontrada');
         return [];
       }
 
       // 2. Para cada organização, busca os repositórios COM PAGINAÇÃO MANUAL
       for (const org of orgs) {
         try {
-          console.log(`[fetchOrganizationRepositories] Buscando TODOS os repos de ${org.login}...`);
           let page = 1;
           let hasMore = true;
-          let orgRepoCount = 0;
 
           while (hasMore) {
             const response = await octokit.repos.listForOrg({
@@ -183,7 +172,6 @@ export class GitHubService {
             });
 
             const repos = response.data;
-            console.log(`[fetchOrganizationRepositories] ${org.login} página ${page}: ${repos.length} repos`);
 
             if (repos.length === 0) {
               hasMore = false;
@@ -193,7 +181,6 @@ export class GitHubService {
                 if (!repoIds.has(repo.id) && repo.owner.type === 'Organization') {
                   repoIds.add(repo.id);
                   allRepos.push(repo as GitHubRepository);
-                  orgRepoCount++;
                 }
               });
               page++;
@@ -204,7 +191,6 @@ export class GitHubService {
               }
             }
           }
-          console.log(`[fetchOrganizationRepositories] Total de ${org.login}: ${orgRepoCount} repos`);
         } catch (orgError: any) {
           // Se não tiver permissão para listar repos da org, ignora
           console.warn(`[fetchOrganizationRepositories] Não foi possível listar repos de ${org.login}:`, orgError.message);
@@ -216,9 +202,6 @@ export class GitHubService {
       throw error;
     }
 
-    console.log(`[fetchOrganizationRepositories] =============================`);
-    console.log(`[fetchOrganizationRepositories] TOTAL FINAL: ${allRepos.length} repositórios de organizações`);
-    console.log(`[fetchOrganizationRepositories] =============================`);
     return allRepos;
   }
 
@@ -449,18 +432,28 @@ export class GitHubService {
   }
 
   /**
-   * Busca todos os PRs abertos relacionados a releases (título contém "Release" ou "Remove Release")
+   * Busca PRs abertos relacionados a releases (título contém "Release" ou "Remove Release")
    * Apenas PRs com base branch "develop"
+   * @param specificRepos Lista opcional de repositórios no formato "owner/repo". Se não fornecido, busca em todos.
    */
-  getOpenReleasePRs(): Observable<Array<{ repo: string; title: string; url: string; number: number; demandId?: string }>> {
+  getOpenReleasePRs(specificRepos?: string[]): Observable<Array<{ repo: string; title: string; url: string; number: number; demandId?: string }>> {
     const octokit = this.getOctokit();
     if (!octokit) {
       return throwError(() => new Error('Nenhum token disponível'));
     }
 
-    return this.getUserRepositories().pipe(
+    // Se foram fornecidos repositórios específicos, usa eles. Senão, busca todos.
+    const reposObservable = specificRepos && specificRepos.length > 0
+      ? of(specificRepos.map(repoFullName => ({ full_name: repoFullName })))
+      : this.getUserRepositories();
+
+    return reposObservable.pipe(
       switchMap(repos => {
-        // Busca PRs abertos de todos os repositórios
+        if (repos.length === 0) {
+          return of([]);
+        }
+
+        // Busca PRs abertos apenas dos repositórios especificados
         const prOperations = repos.map(repo => {
           const [owner, repoName] = repo.full_name.split('/');
           
@@ -569,8 +562,6 @@ export class GitHubService {
       return throwError(() => new Error('Nenhum token disponível'));
     }
 
-    console.log(`[listReleasesFromRepo] Buscando releases em ${owner}/${repo} branch develop...`);
-
     return from(
       octokit.repos.getContent({
         owner,
@@ -580,7 +571,6 @@ export class GitHubService {
       })
     ).pipe(
       map(response => {
-        console.log(`[listReleasesFromRepo] Resposta de ${owner}/${repo}:`, response.data);
         if (Array.isArray(response.data)) {
           const files = response.data
             .filter((file: any) => file.type === 'file' && file.name.endsWith('.md'))
@@ -589,7 +579,6 @@ export class GitHubService {
               path: file.path,
               sha: file.sha
             }));
-          console.log(`[listReleasesFromRepo] Encontrados ${files.length} arquivos .md em ${owner}/${repo}`);
           return files;
         }
         return [];
@@ -598,7 +587,6 @@ export class GitHubService {
         console.error(`[listReleasesFromRepo] Erro em ${owner}/${repo}:`, error.status, error.message);
         // 404 = pasta releases não existe ou branch não existe
         if (error.status === 404) {
-          console.log(`[listReleasesFromRepo] 404 - pasta releases/ ou branch develop não existe em ${owner}/${repo}`);
           return of([]);
         }
         return of([]);
@@ -617,19 +605,11 @@ export class GitHubService {
    * Lista todas as releases de todos os repositórios acessíveis
    */
   listAllReleasesFromRepos(): Observable<{ repo: string; releases: { name: string; path: string; sha: string }[] }[]> {
-    console.log('[listAllReleasesFromRepos] Iniciando busca de releases...');
-    
     return this.getUserRepositories().pipe(
       switchMap(repos => {
-        console.log(`[listAllReleasesFromRepos] Encontrados ${repos.length} repositórios`);
-        
         if (repos.length === 0) {
-          console.log('[listAllReleasesFromRepos] Nenhum repositório encontrado');
           return of([]);
         }
-        
-        // Log dos repos encontrados
-        repos.forEach(r => console.log(`[listAllReleasesFromRepos] Repo: ${r.full_name}`));
         
         const operations = repos.map(repo => {
           const repoInfo = this.parseRepositoryUrl(repo.html_url);
@@ -640,7 +620,6 @@ export class GitHubService {
           
           return this.listReleasesFromRepo(repoInfo.owner, repoInfo.repo).pipe(
             map(releases => {
-              console.log(`[listAllReleasesFromRepos] ${repo.full_name} tem ${releases.length} releases`);
               return { repo: repo.full_name, releases };
             }),
             catchError(err => {
@@ -653,9 +632,7 @@ export class GitHubService {
         return forkJoin(operations);
       }),
       map(results => {
-        const filtered = results.filter(r => r.releases.length > 0);
-        console.log(`[listAllReleasesFromRepos] Total de repos com releases: ${filtered.length}`);
-        return filtered;
+        return results.filter(r => r.releases.length > 0);
       })
     );
   }
