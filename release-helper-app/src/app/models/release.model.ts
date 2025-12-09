@@ -14,6 +14,8 @@ export interface Release {
   observations: string;
   createdAt: Date;
   updatedAt: Date;
+  createdBy?: string; // Login do usuário que criou (ex: GitHub login)
+  updatedBy?: string; // Login do usuário que fez a última atualização
 }
 
 /**

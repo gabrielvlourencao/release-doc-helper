@@ -1,0 +1,19 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Regras para a coleção de releases
+    match /releases/{releaseId} {
+      // Permite leitura para todos (qualquer usuário pode ver as releases)
+      allow read: if true;
+      
+      // Permite escrita para todos (para facilitar sincronização do GitHub)
+      // IMPORTANTE: Em produção, considere usar autenticação:
+      // allow write: if request.auth != null;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if true;
+    }
+  }
+}
+

@@ -119,8 +119,8 @@ export class GitHubService {
   }
 
   /**
-   * Lista TODOS os repositórios que o usuário tem acesso (com paginação)
-   * Inclui: repos próprios, de organizações e onde é colaborador
+   * Lista APENAS repositórios de organizações (ignora repositórios pessoais)
+   * Apenas repositórios de organizações são sincronizados no Firestore
    */
   getUserRepositories(): Observable<GitHubRepository[]> {
     const octokit = this.getOctokit();
@@ -128,12 +128,12 @@ export class GitHubService {
       return throwError(() => new Error('Nenhum token disponível. Configure o token de serviço ou faça login com GitHub.'));
     }
 
-    // Busca repositórios do usuário + organizações em paralelo
-    return from(this.fetchAllRepositories(octokit)).pipe(
+    // Busca APENAS repositórios de organizações (ignora pessoais)
+    return from(this.fetchOrganizationRepositories(octokit)).pipe(
       map(repos => {
-        console.log(`[getUserRepositories] Total de repositórios encontrados: ${repos.length}`);
+        console.log(`[getUserRepositories] Total de repositórios de organizações encontrados: ${repos.length}`);
         // Lista todos os nomes para debug
-        repos.forEach(r => console.log(`  - ${r.full_name}`));
+        repos.forEach(r => console.log(`  - ${r.full_name} (${r.owner.type})`));
         return repos;
       }),
       catchError(error => {
@@ -144,42 +144,31 @@ export class GitHubService {
   }
 
   /**
-   * Busca todos os repositórios: do usuário + de todas as organizações (com paginação manual)
+   * Busca APENAS repositórios de organizações (ignora repositórios pessoais)
+   * Repositórios pessoais não são sincronizados no Firestore
    */
-  private async fetchAllRepositories(octokit: Octokit): Promise<GitHubRepository[]> {
+  private async fetchOrganizationRepositories(octokit: Octokit): Promise<GitHubRepository[]> {
     const allRepos: GitHubRepository[] = [];
     const repoIds = new Set<number>(); // Para evitar duplicatas
 
     try {
-      // 1. Busca repositórios do usuário autenticado (com paginação)
-      console.log('[fetchAllRepositories] Buscando repos do usuário...');
-      const userRepos = await octokit.paginate(octokit.repos.listForAuthenticatedUser, {
-        visibility: 'all',
-        affiliation: 'owner,collaborator,organization_member',
-        sort: 'updated',
-        per_page: 100
-      });
-      
-      userRepos.forEach(repo => {
-        if (!repoIds.has(repo.id)) {
-          repoIds.add(repo.id);
-          allRepos.push(repo as GitHubRepository);
-        }
-      });
-      console.log(`[fetchAllRepositories] Repos do usuário (paginado): ${userRepos.length}`);
-
-      // 2. Busca organizações do usuário
-      console.log('[fetchAllRepositories] Buscando organizações...');
+      // 1. Busca organizações do usuário
+      console.log('[fetchOrganizationRepositories] Buscando organizações...');
       const orgs = await octokit.paginate(octokit.orgs.listForAuthenticatedUser, {
         per_page: 100
       });
-      console.log(`[fetchAllRepositories] Organizações encontradas: ${orgs.length}`);
+      console.log(`[fetchOrganizationRepositories] Organizações encontradas: ${orgs.length}`);
       orgs.forEach(o => console.log(`  - Org: ${o.login}`));
 
-      // 3. Para cada organização, busca os repositórios COM PAGINAÇÃO MANUAL
+      if (orgs.length === 0) {
+        console.log('[fetchOrganizationRepositories] Nenhuma organização encontrada');
+        return [];
+      }
+
+      // 2. Para cada organização, busca os repositórios COM PAGINAÇÃO MANUAL
       for (const org of orgs) {
         try {
-          console.log(`[fetchAllRepositories] Buscando TODOS os repos de ${org.login}...`);
+          console.log(`[fetchOrganizationRepositories] Buscando TODOS os repos de ${org.login}...`);
           let page = 1;
           let hasMore = true;
           let orgRepoCount = 0;
@@ -194,13 +183,14 @@ export class GitHubService {
             });
 
             const repos = response.data;
-            console.log(`[fetchAllRepositories] ${org.login} página ${page}: ${repos.length} repos`);
+            console.log(`[fetchOrganizationRepositories] ${org.login} página ${page}: ${repos.length} repos`);
 
             if (repos.length === 0) {
               hasMore = false;
             } else {
               repos.forEach(repo => {
-                if (!repoIds.has(repo.id)) {
+                // Garante que é de uma organização (não pessoal)
+                if (!repoIds.has(repo.id) && repo.owner.type === 'Organization') {
                   repoIds.add(repo.id);
                   allRepos.push(repo as GitHubRepository);
                   orgRepoCount++;
@@ -209,26 +199,26 @@ export class GitHubService {
               page++;
               // Segurança: máximo de 50 páginas (5000 repos)
               if (page > 50) {
-                console.warn(`[fetchAllRepositories] ${org.login}: limite de páginas atingido`);
+                console.warn(`[fetchOrganizationRepositories] ${org.login}: limite de páginas atingido`);
                 hasMore = false;
               }
             }
           }
-          console.log(`[fetchAllRepositories] Total de ${org.login}: ${orgRepoCount} repos novos`);
+          console.log(`[fetchOrganizationRepositories] Total de ${org.login}: ${orgRepoCount} repos`);
         } catch (orgError: any) {
           // Se não tiver permissão para listar repos da org, ignora
-          console.warn(`[fetchAllRepositories] Não foi possível listar repos de ${org.login}:`, orgError.message);
+          console.warn(`[fetchOrganizationRepositories] Não foi possível listar repos de ${org.login}:`, orgError.message);
         }
       }
 
     } catch (error) {
-      console.error('[fetchAllRepositories] Erro:', error);
+      console.error('[fetchOrganizationRepositories] Erro:', error);
       throw error;
     }
 
-    console.log(`[fetchAllRepositories] =============================`);
-    console.log(`[fetchAllRepositories] TOTAL FINAL: ${allRepos.length} repositórios`);
-    console.log(`[fetchAllRepositories] =============================`);
+    console.log(`[fetchOrganizationRepositories] =============================`);
+    console.log(`[fetchOrganizationRepositories] TOTAL FINAL: ${allRepos.length} repositórios de organizações`);
+    console.log(`[fetchOrganizationRepositories] =============================`);
     return allRepos;
   }
 
@@ -454,6 +444,75 @@ export class GitHubService {
       catchError(error => {
         console.error('Erro ao criar Pull Request:', error);
         return throwError(() => error);
+      })
+    );
+  }
+
+  /**
+   * Busca todos os PRs abertos relacionados a releases (título contém "Release" ou "Remove Release")
+   * Apenas PRs com base branch "develop"
+   */
+  getOpenReleasePRs(): Observable<Array<{ repo: string; title: string; url: string; number: number; demandId?: string }>> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    return this.getUserRepositories().pipe(
+      switchMap(repos => {
+        // Busca PRs abertos de todos os repositórios
+        const prOperations = repos.map(repo => {
+          const [owner, repoName] = repo.full_name.split('/');
+          
+          return from(
+            octokit.pulls.list({
+              owner,
+              repo: repoName,
+              state: 'open',
+              base: 'develop',
+              per_page: 100
+            })
+          ).pipe(
+            map(response => {
+              // Filtra apenas PRs relacionados a releases
+              return response.data
+                .filter(pr => {
+                  const title = pr.title || '';
+                  return title.startsWith('Release ') || title.startsWith('Remove Release ');
+                })
+                .map(pr => {
+                  // Tenta extrair o demandId do título
+                  const demandIdMatch = pr.title.match(/Release\s+([A-Z0-9-]+)/i) || 
+                                       pr.title.match(/Remove Release\s+([A-Z0-9-]+)/i);
+                  
+                  return {
+                    repo: repo.full_name,
+                    title: pr.title,
+                    url: pr.html_url,
+                    number: pr.number,
+                    demandId: demandIdMatch ? demandIdMatch[1] : undefined
+                  };
+                });
+            }),
+            catchError(error => {
+              // Se não tiver permissão ou erro, retorna array vazio
+              console.warn(`Erro ao buscar PRs de ${repo.full_name}:`, error.message);
+              return of([]);
+            })
+          );
+        });
+
+        return forkJoin(prOperations).pipe(
+          map(results => {
+            // Flatten e ordena por repositório
+            const allPRs = results.flat();
+            return allPRs.sort((a, b) => a.repo.localeCompare(b.repo));
+          })
+        );
+      }),
+      catchError(error => {
+        console.error('Erro ao buscar PRs de releases:', error);
+        return of([]);
       })
     );
   }

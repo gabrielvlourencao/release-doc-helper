@@ -4,7 +4,7 @@ import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
 
 import { Release } from '../../models';
-import { ReleaseService } from '../../core';
+import { ReleaseService, SyncService, GitHubService, NotificationService } from '../../core';
 
 /**
  * Componente da página inicial
@@ -34,6 +34,62 @@ import { ReleaseService } from '../../core';
               </svg>
               Ver Documentos
             </a>
+          </div>
+        </div>
+      </section>
+
+      <!-- Aviso sobre Sincronização -->
+      <section class="mb-8">
+        <div class="card border-2 border-blue-200 bg-blue-50">
+          <div class="p-6">
+            <div class="flex items-start gap-4">
+              <div class="flex-shrink-0 w-10 h-10 rounded-xl bg-blue-500 text-white flex items-center justify-center">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+              </div>
+              <div class="flex-1">
+                <h3 class="text-lg font-bold text-blue-900 mb-2">Como funciona a sincronização?</h3>
+                <div class="text-blue-800 space-y-3">
+                  <p class="font-medium">📝 <strong>Releases Locais:</strong></p>
+                  <p class="text-sm ml-6">
+                    Quando você cria uma nova release, ela fica apenas no seu navegador (localStorage). 
+                    Ela <strong>NÃO</strong> aparece para outros usuários ainda.
+                  </p>
+                  
+                  <p class="font-medium">🚀 <strong>Versionamento:</strong></p>
+                  <p class="text-sm ml-6">
+                    Ao clicar em "Versionar", o sistema cria os arquivos e abre Pull Requests no GitHub. 
+                    A release continua apenas local até você fazer merge do PR.
+                  </p>
+                  
+                  <p class="font-medium">🔄 <strong>Sincronização:</strong></p>
+                  <p class="text-sm ml-6">
+                    Após fazer merge do PR no GitHub, clique no botão "Sincronizar com GitHub" abaixo. 
+                    O sistema buscará todas as releases dos repositórios e atualizará o banco compartilhado (Firestore). 
+                    <strong>Agora todos os usuários verão a mesma release!</strong>
+                  </p>
+                  
+                  <div class="mt-4 pt-4 border-t border-blue-200">
+                    <button 
+                      (click)="syncWithGitHub()" 
+                      [disabled]="isSyncing || !canSync"
+                      class="inline-flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+                      <svg *ngIf="!isSyncing" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                      </svg>
+                      <svg *ngIf="isSyncing" class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                      </svg>
+                      <span>{{ isSyncing ? 'Sincronizando...' : 'Sincronizar com GitHub' }}</span>
+                    </button>
+                    <p *ngIf="!canSync" class="text-xs text-blue-600 mt-2">
+                      ⚠️ Faça login com GitHub ou configure um token de serviço para sincronizar
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -330,13 +386,21 @@ import { ReleaseService } from '../../core';
 export class HomeComponent implements OnInit, OnDestroy {
   totalReleases = 0;
   recentReleases: Release[] = [];
+  isSyncing = false;
+  canSync = false;
 
   private destroy$ = new Subject<void>();
 
   constructor(
     private releaseService: ReleaseService,
-    private router: Router
-  ) {}
+    private router: Router,
+    private syncService: SyncService,
+    private githubService: GitHubService,
+    private notificationService: NotificationService
+  ) {
+    // Verifica se pode sincronizar
+    this.canSync = this.githubService.hasValidToken();
+  }
 
   ngOnInit(): void {
     this.loadReleases();
@@ -367,5 +431,37 @@ export class HomeComponent implements OnInit, OnDestroy {
     if (element) {
       element.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
+  }
+
+  syncWithGitHub(): void {
+    if (this.isSyncing || !this.canSync) {
+      return;
+    }
+
+    this.isSyncing = true;
+    this.syncService.syncFromGitHub().subscribe({
+      next: (result) => {
+        this.isSyncing = false;
+        if (result.synced > 0 || result.removed > 0) {
+          let message = 'Sincronização concluída!';
+          if (result.synced > 0) {
+            message += ` ${result.synced} release(s) atualizada(s).`;
+          }
+          if (result.removed > 0) {
+            message += ` ${result.removed} release(s) removida(s) do Firestore.`;
+          }
+          this.notificationService.success(message);
+          // Recarrega as releases para mostrar as atualizadas
+          this.loadReleases();
+        } else if (result.errors && result.errors.length > 0) {
+          this.notificationService.warning('Sincronização concluída com alguns erros. Verifique o console.');
+        }
+      },
+      error: (error) => {
+        this.isSyncing = false;
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.notificationService.error(`Erro ao sincronizar: ${errorMessage}`);
+      }
+    });
   }
 }
