@@ -51,23 +51,24 @@ import { ReleaseService, SyncService, GitHubService, NotificationService } from 
               <div class="flex-1">
                 <h3 class="text-lg font-bold text-blue-900 mb-2">Como funciona a sincronização?</h3>
                 <div class="text-blue-800 space-y-3">
-                  <p class="font-medium">📝 <strong>Releases Locais:</strong></p>
+                  <p class="font-medium">📝 <strong>Releases Compartilhadas:</strong></p>
                   <p class="text-sm ml-6">
-                    Quando você cria uma nova release, ela fica apenas no seu navegador (localStorage). 
-                    Ela <strong>NÃO</strong> aparece para outros usuários ainda.
+                    Quando você cria uma nova release, ela é salva no banco compartilhado (Firestore). 
+                    <strong>Todos os usuários podem ver e editar</strong> as releases antes mesmo de versioná-las.
                   </p>
                   
                   <p class="font-medium">🚀 <strong>Versionamento:</strong></p>
                   <p class="text-sm ml-6">
-                    Ao clicar em "Versionar", o sistema cria os arquivos e abre Pull Requests no GitHub. 
-                    A release continua apenas local até você fazer merge do PR.
+                    Você pode editar e revisar releases antes de versionar. Ao clicar em "Versionar", 
+                    o sistema cria os arquivos e abre Pull Requests no GitHub. 
+                    As releases já estão visíveis para todos antes do versionamento!
                   </p>
                   
                   <p class="font-medium">🔄 <strong>Sincronização:</strong></p>
                   <p class="text-sm ml-6">
                     Após fazer merge do PR no GitHub, clique no botão "Sincronizar com GitHub" abaixo. 
                     O sistema buscará todas as releases dos repositórios e atualizará o banco compartilhado (Firestore). 
-                    <strong>Agora todos os usuários verão a mesma release!</strong>
+                    <strong>Isso garante que as releases versionadas estejam sempre sincronizadas!</strong>
                   </p>
                   
                   <div class="mt-4 pt-4 border-t border-blue-200">
