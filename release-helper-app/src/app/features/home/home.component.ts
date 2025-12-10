@@ -4,7 +4,7 @@ import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
 
 import { Release } from '../../models';
-import { ReleaseService, SyncService, GitHubService, NotificationService } from '../../core';
+import { ReleaseService, SyncService, GitHubService, NotificationService, LocalStorageReleaseService } from '../../core';
 
 /**
  * Componente da página inicial
@@ -49,26 +49,27 @@ import { ReleaseService, SyncService, GitHubService, NotificationService } from 
                 </svg>
               </div>
               <div class="flex-1">
-                <h3 class="text-lg font-bold text-blue-900 mb-2">Como funciona a sincronização?</h3>
+                <h3 class="text-lg font-bold text-blue-900 mb-2">Como funciona o versionamento?</h3>
                 <div class="text-blue-800 space-y-3">
-                  <p class="font-medium">📝 <strong>Releases Compartilhadas:</strong></p>
+                  <p class="font-medium">📝 <strong>Criação e Edição:</strong></p>
                   <p class="text-sm ml-6">
-                    Quando você cria uma nova release, ela é salva no banco compartilhado (Firestore). 
-                    <strong>Todos os usuários podem ver e editar</strong> as releases antes mesmo de versioná-las.
+                    Quando você cria ou edita uma release, ela é salva localmente no seu navegador (localStorage). 
+                    <strong>Automaticamente, commits são criados na branch <code>feature/upsert-release</code></strong> 
+                    nos repositórios GitHub configurados, permitindo que você edite e revise antes de versionar.
                   </p>
                   
                   <p class="font-medium">🚀 <strong>Versionamento:</strong></p>
                   <p class="text-sm ml-6">
-                    Você pode editar e revisar releases antes de versionar. Ao clicar em "Versionar", 
-                    o sistema cria os arquivos e abre Pull Requests no GitHub. 
-                    As releases já estão visíveis para todos antes do versionamento!
+                    Ao clicar em "Versionar", o sistema abre Pull Requests da branch <code>feature/upsert-release</code> 
+                    para a branch <code>develop</code>. Todos os commits de criação/edição já estão na branch, 
+                    prontos para revisão e merge.
                   </p>
                   
                   <p class="font-medium">🔄 <strong>Sincronização:</strong></p>
                   <p class="text-sm ml-6">
-                    Após fazer merge do PR no GitHub, clique no botão "Sincronizar com GitHub" abaixo. 
-                    O sistema buscará todas as releases dos repositórios e atualizará o banco compartilhado (Firestore). 
-                    <strong>Isso garante que as releases versionadas estejam sempre sincronizadas!</strong>
+                    Se seu localStorage estiver vazio, a sincronização acontece automaticamente ao abrir a página. 
+                    Você também pode clicar em "Sincronizar com GitHub" para buscar releases versionadas dos repositórios. 
+                    <strong>Releases versionadas são sempre sincronizadas do GitHub!</strong>
                   </p>
                   
                   <div class="mt-4 pt-4 border-t border-blue-200">
@@ -397,14 +398,34 @@ export class HomeComponent implements OnInit, OnDestroy {
     private router: Router,
     private syncService: SyncService,
     private githubService: GitHubService,
-    private notificationService: NotificationService
+    private notificationService: NotificationService,
+    private localStorageReleaseService: LocalStorageReleaseService
   ) {
     // Verifica se pode sincronizar
     this.canSync = this.githubService.hasValidToken();
   }
 
   ngOnInit(): void {
-    this.loadReleases();
+    // Se localStorage estiver vazio e tiver token, sincroniza automaticamente
+    if (!this.localStorageReleaseService.hasReleases() && this.githubService.hasValidToken()) {
+      this.isSyncing = true;
+      this.syncService.syncFromGitHub().subscribe({
+        next: (result) => {
+          this.isSyncing = false;
+          this.loadReleases();
+          if (result.synced > 0) {
+            this.notificationService.success(`Sincronização automática concluída! ${result.synced} release(s) carregada(s).`);
+          }
+        },
+        error: (error) => {
+          this.isSyncing = false;
+          this.loadReleases(); // Carrega mesmo se falhar
+          console.error('Erro na sincronização automática:', error);
+        }
+      });
+    } else {
+      this.loadReleases();
+    }
   }
 
   ngOnDestroy(): void {
@@ -449,7 +470,7 @@ export class HomeComponent implements OnInit, OnDestroy {
             message += ` ${result.synced} release(s) atualizada(s).`;
           }
           if (result.removed > 0) {
-            message += ` ${result.removed} release(s) removida(s) do Firestore.`;
+            message += ` ${result.removed} release(s) removida(s) do localStorage.`;
           }
           this.notificationService.success(message);
           // Recarrega as releases para mostrar as atualizadas

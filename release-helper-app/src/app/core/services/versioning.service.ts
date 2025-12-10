@@ -63,30 +63,32 @@ export class VersioningService {
       }
 
       const { owner, repo } = repoInfo;
-      const branchName = `feature/upsert-release-doc`;
+      const branchName = `feature/upsert-release`;
       const baseBranch = 'develop'; // Sempre develop, nunca main
 
-      // 1. Cria a branch
+      // 1. Garante que a branch feature/upsert-release existe (já deve ter commits da criação/edição)
       return this.githubService.createBranch(owner, repo, branchName, baseBranch).pipe(
         catchError(err => {
-          if (err.status === 422) return of(void 0);
+          if (err.status === 422) return of(void 0); // Branch já existe, continua
           results.errors?.push(`Erro ao criar branch em ${repo}: ${err.message}`);
           return of(void 0);
         }),
-        // 2. Cria/atualiza o arquivo de release
+        // 2. Verifica se já tem commits na branch (se não, cria/atualiza os arquivos)
         switchMap(() => {
+          // Se a release já foi criada/editada, os arquivos já devem estar na branch
+          // Mas vamos garantir que está tudo atualizado
           const markdown = this.releaseService.generateMarkdown(release);
           const filePath = `releases/release_${release.demandId}.md`;
-          const message = `docs: adiciona release ${release.demandId}`;
+          const message = `docs: versiona release ${release.demandId}`;
 
           return this.githubService.createOrUpdateFile(owner, repo, filePath, markdown, message, branchName).pipe(
             catchError(err => {
-              results.errors?.push(`Erro ao criar arquivo em ${repo}: ${err.message}`);
+              results.errors?.push(`Erro ao atualizar arquivo em ${repo}: ${err.message}`);
               return of(void 0);
             })
           );
         }),
-        // 3. Cria os scripts se houver
+        // 3. Atualiza os scripts se houver
         switchMap(() => {
           if (release.scripts.length === 0) return of(void 0);
 
@@ -94,11 +96,11 @@ export class VersioningService {
             .filter(script => script.content)
             .map(script => {
               const scriptPath = `scripts/${release.demandId}/${script.name}`;
-              const message = `docs: adiciona script ${script.name} para release ${release.demandId}`;
+              const message = `docs: versiona script ${script.name} para release ${release.demandId}`;
 
               return this.githubService.createOrUpdateFile(owner, repo, scriptPath, script.content!, message, branchName).pipe(
                 catchError(err => {
-                  results.errors?.push(`Erro ao criar script ${script.name} em ${repo}: ${err.message}`);
+                  results.errors?.push(`Erro ao atualizar script ${script.name} em ${repo}: ${err.message}`);
                   return of(void 0);
                 })
               );
@@ -106,7 +108,7 @@ export class VersioningService {
 
           return forkJoin(scriptOperations.length > 0 ? scriptOperations : [of(void 0)]);
         }),
-        // 4. Cria o Pull Request
+        // 4. Cria o Pull Request da branch feature/upsert-release
         switchMap(() => {
           const prTitle = `Release ${release.demandId}: ${release.title || release.description}`;
           const prBody = this.generatePRBody(release);
@@ -139,7 +141,7 @@ export class VersioningService {
         }
         // Se o versionamento foi bem-sucedido (pelo menos um PR criado), marca como versionada
         if (results.success && results.prs && results.prs.length > 0) {
-          // Atualiza a release no Firestore marcando como versionada
+          // Atualiza a release no localStorage marcando como versionada
           this.releaseService.update(release.id, { isVersioned: true }).subscribe({
             error: (err) => console.error('Erro ao atualizar status de versionamento:', err)
           });

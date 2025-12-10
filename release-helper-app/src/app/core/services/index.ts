@@ -7,4 +7,5 @@ export * from './github-auth.service';
 export * from './github.service';
 export * from './versioning.service';
 export * from './firestore-release.service';
+export * from './local-storage-release.service';
 export * from './sync.service';

@@ -13,7 +13,7 @@ import {
   VersioningResult,
   VersionedFile
 } from '../../models';
-import { FirestoreReleaseService } from './firestore-release.service';
+import { LocalStorageReleaseService } from './local-storage-release.service';
 import { GitHubAuthService } from './github-auth.service';
 import { GitHubService } from './github.service';
 
@@ -29,18 +29,20 @@ export interface GitHubReleaseFile {
 /**
  * Serviço para gerenciamento de Releases
  * 
- * Usa apenas Firestore para armazenamento, permitindo edição colaborativa
- * entre múltiplos usuários antes de versionar no GitHub.
+ * Usa localStorage para armazenamento local e cria commits na branch
+ * feature/upsert-release quando criar/editar releases não versionadas.
  */
 @Injectable({
   providedIn: 'root'
 })
 export class ReleaseService {
-  // Observable de releases do Firestore
-  releases$ = this.firestoreReleaseService.getAll();
+  // Observable de releases do localStorage
+  releases$ = this.localStorageReleaseService.getAll();
+
+  private readonly UPSERT_BRANCH = 'feature/upsert-release';
 
   constructor(
-    private firestoreReleaseService: FirestoreReleaseService,
+    private localStorageReleaseService: LocalStorageReleaseService,
     private authService: GitHubAuthService,
     private githubService: GitHubService
   ) {}
@@ -115,37 +117,70 @@ export class ReleaseService {
   }
 
   /**
-   * Cria nova release e salva no Firestore para permitir edição colaborativa
+   * Cria nova release e salva no localStorage e cria commit na branch feature/upsert-release
    */
   create(release: Omit<Release, 'id' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'isVersioned'>): Observable<Release> {
-    const currentUser = this.getCurrentUserLogin();
-    const newRelease: Release = {
-      ...release,
-      id: this.generateId(),
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      createdBy: currentUser,
-      updatedBy: currentUser,
-      isVersioned: false // Nova release sempre começa como não versionada
-    };
+    // Verifica se já existe uma release com o mesmo demandId
+    return this.localStorageReleaseService.getByDemandId(release.demandId).pipe(
+      take(1),
+      switchMap(existingRelease => {
+        if (existingRelease) {
+          // Se já existe, atualiza ao invés de criar nova
+          return this.update(existingRelease.id, {
+            ...release,
+            isVersioned: false
+          }).pipe(
+            map(updated => updated!),
+            catchError(error => {
+              console.error('Erro ao atualizar release existente:', error);
+              return throwError(() => error);
+            })
+          );
+        }
+        
+        // Cria nova release
+        const currentUser = this.getCurrentUserLogin();
+        const newRelease: Release = {
+          ...release,
+          id: this.generateId(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          createdBy: currentUser,
+          updatedBy: currentUser,
+          isVersioned: false // Nova release sempre começa como não versionada
+        };
 
-    // Salva no Firestore
-    return this.firestoreReleaseService.syncRelease(newRelease).pipe(
-      map(() => newRelease),
-      catchError(error => {
-        console.error('Erro ao criar release no Firestore:', error);
-        return throwError(() => error);
+        // Salva no localStorage
+        return this.localStorageReleaseService.syncRelease(newRelease).pipe(
+          switchMap(() => {
+            // Se tem repositórios e token GitHub, cria commit na branch feature/upsert-release
+            if (release.repositories && release.repositories.length > 0 && this.githubService.hasValidToken()) {
+              return this.commitToUpsertBranch(newRelease, 'create').pipe(
+                map(() => newRelease),
+                catchError(error => {
+                  console.warn('Erro ao criar commit na branch feature/upsert-release:', error);
+                  // Continua mesmo se falhar o commit, a release já está salva no localStorage
+                  return of(newRelease);
+                })
+              );
+            }
+            return of(newRelease);
+          }),
+          catchError(error => {
+            console.error('Erro ao criar release:', error);
+            return throwError(() => error);
+          })
+        );
       })
     );
   }
 
   /**
-   * Atualiza release existente no Firestore
-   * Permite edição colaborativa antes de versionar
+   * Atualiza release existente no localStorage e cria commit na branch feature/upsert-release
    * Quando uma release é editada, ela é marcada como não versionada
    */
   update(id: string, changes: Partial<Release>): Observable<Release | null> {
-    // Busca a release no Firestore
+    // Busca a release no localStorage
     return this.releases$.pipe(
       take(1),
       switchMap(releases => {
@@ -157,21 +192,37 @@ export class ReleaseService {
         }
 
         const currentUser = this.getCurrentUserLogin();
+        const wasVersioned = release.isVersioned ?? false;
+        
         const updatedRelease: Release = {
           ...release,
           ...changes,
           id,
           updatedAt: new Date(),
           updatedBy: currentUser || release.updatedBy,
-          // Marca como não versionada quando editada (a menos que explicitamente seja definido como versionada)
-          isVersioned: changes.isVersioned !== undefined ? changes.isVersioned : false
+          // Se estava versionada, mantém como versionada (agora terá commits pendentes)
+          // Se não estava versionada, mantém como não versionada
+          isVersioned: changes.isVersioned !== undefined ? changes.isVersioned : wasVersioned
         };
 
-        // Atualiza no Firestore
-        return this.firestoreReleaseService.syncRelease(updatedRelease).pipe(
-          map(() => updatedRelease),
+        // Atualiza no localStorage
+        return this.localStorageReleaseService.syncRelease(updatedRelease).pipe(
+          switchMap(() => {
+            // Se tem repositórios e token GitHub, cria commit na branch feature/upsert-release
+            if (updatedRelease.repositories && updatedRelease.repositories.length > 0 && this.githubService.hasValidToken()) {
+              return this.commitToUpsertBranch(updatedRelease, 'update').pipe(
+                map(() => updatedRelease),
+                catchError(error => {
+                  console.warn('Erro ao criar commit na branch feature/upsert-release:', error);
+                  // Continua mesmo se falhar o commit, a release já está salva no localStorage
+                  return of(updatedRelease);
+                })
+              );
+            }
+            return of(updatedRelease);
+          }),
           catchError(error => {
-            console.error('Erro ao atualizar release no Firestore:', error);
+            console.error('Erro ao atualizar release:', error);
             return throwError(() => error);
           })
         );
@@ -180,13 +231,13 @@ export class ReleaseService {
   }
 
   /**
-   * Remove release do Firestore
+   * Remove release do localStorage
    */
   delete(id: string): Observable<boolean> {
-    return this.firestoreReleaseService.deleteRelease(id).pipe(
+    return this.localStorageReleaseService.deleteRelease(id).pipe(
       map(() => true),
       catchError(error => {
-        console.error('Erro ao deletar release do Firestore:', error);
+        console.error('Erro ao deletar release:', error);
         return of(false);
       })
     );
@@ -473,24 +524,26 @@ export class ReleaseService {
 
   /**
    * Cria/atualiza release a partir de dados do GitHub
-   * Este método é usado pelo SyncService para sincronizar releases do GitHub para o Firestore.
+   * Este método é usado pelo SyncService para sincronizar releases do GitHub para o localStorage.
    * Releases sincronizadas do GitHub são marcadas como versionadas
    */
   createOrUpdateFromGitHub(releaseData: Partial<Release>, sourceRepo: string, sourcePath: string): Observable<Release> {
-    // Verifica se já existe uma release com esse demandId no Firestore
-    return this.firestoreReleaseService.getByDemandId(releaseData.demandId || '').pipe(
+    // Verifica se já existe uma release com esse demandId no localStorage
+    return this.localStorageReleaseService.getByDemandId(releaseData.demandId || '').pipe(
       take(1),
       switchMap(existing => {
         if (existing) {
           // Atualiza, preservando createdBy/updatedBy se vierem do releaseData
           // Mas marca como versionada porque veio do GitHub
-          return this.update(existing.id, {
+          return this.localStorageReleaseService.syncRelease({
+            ...existing,
             ...releaseData,
+            id: existing.id,
             updatedAt: new Date(),
             createdBy: releaseData.createdBy || existing.createdBy,
             updatedBy: releaseData.updatedBy || existing.updatedBy,
             isVersioned: true // Releases do GitHub são versionadas
-          }).pipe(map(r => r!));
+          }).pipe(map(() => ({ ...existing, ...releaseData, isVersioned: true } as Release)));
         } else {
           // Cria nova, preservando createdBy/updatedBy se vierem do releaseData
           const newRelease: Release = {
@@ -510,10 +563,77 @@ export class ReleaseService {
             isVersioned: true // Releases do GitHub são versionadas
           };
 
-          return this.firestoreReleaseService.syncRelease(newRelease).pipe(
+          return this.localStorageReleaseService.syncRelease(newRelease).pipe(
             map(() => newRelease)
           );
         }
+      })
+    );
+  }
+
+  /**
+   * Cria commit na branch feature/upsert-release para releases não versionadas
+   */
+  private commitToUpsertBranch(release: Release, action: 'create' | 'update'): Observable<void> {
+    if (!release.repositories || release.repositories.length === 0) {
+      return of(void 0);
+    }
+
+    const operations = release.repositories.map(repo => {
+      const repoInfo = this.githubService.parseRepositoryUrl(repo.url);
+      if (!repoInfo) {
+        return of(void 0);
+      }
+
+      const { owner, repo: repoName } = repoInfo;
+      const baseBranch = 'develop';
+
+      // 1. Cria a branch feature/upsert-release se não existir
+      return this.githubService.createBranch(owner, repoName, this.UPSERT_BRANCH, baseBranch).pipe(
+        catchError(() => of(void 0)), // Branch já existe, continua
+        // 2. Cria/atualiza o arquivo de release
+        switchMap(() => {
+          const markdown = this.generateMarkdown(release);
+          const filePath = `releases/release_${release.demandId}.md`;
+          const message = action === 'create' 
+            ? `docs: cria release ${release.demandId}`
+            : `docs: atualiza release ${release.demandId}`;
+
+          return this.githubService.createOrUpdateFile(owner, repoName, filePath, markdown, message, this.UPSERT_BRANCH).pipe(
+            catchError(err => {
+              console.warn(`Erro ao criar/atualizar arquivo em ${repoName}:`, err);
+              return of(void 0);
+            })
+          );
+        }),
+        // 3. Cria/atualiza os scripts se houver
+        switchMap(() => {
+          if (release.scripts.length === 0) return of(void 0);
+
+          const scriptOperations = release.scripts
+            .filter(script => script.content)
+            .map(script => {
+              const scriptPath = `scripts/${release.demandId}/${script.name}`;
+              const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} script ${script.name} para release ${release.demandId}`;
+
+              return this.githubService.createOrUpdateFile(owner, repoName, scriptPath, script.content!, message, this.UPSERT_BRANCH).pipe(
+                catchError(err => {
+                  console.warn(`Erro ao criar/atualizar script ${script.name} em ${repoName}:`, err);
+                  return of(void 0);
+                })
+              );
+            });
+
+          return forkJoin(scriptOperations.length > 0 ? scriptOperations : [of(void 0)]);
+        })
+      );
+    });
+
+    return forkJoin(operations).pipe(
+      map(() => void 0),
+      catchError(error => {
+        console.error('Erro ao criar commits na branch feature/upsert-release:', error);
+        return of(void 0);
       })
     );
   }
@@ -549,6 +669,57 @@ export class ReleaseService {
 
     return forkJoin(checks).pipe(
       map(results => results.some(exists => exists === true))
+    );
+  }
+
+  /**
+   * Verifica se uma release tem commits pendentes de PR
+   * Retorna true se a release está versionada (em develop) mas o arquivo na feature/upsert-release é diferente (não mergeado)
+   */
+  hasPendingCommits(release: Release): Observable<boolean> {
+    // Se não tem repositórios associados, não tem commits pendentes
+    if (!release.repositories || release.repositories.length === 0) {
+      return of(false);
+    }
+
+    // Verifica se tem token GitHub disponível
+    if (!this.githubService.hasValidToken()) {
+      return of(false);
+    }
+
+    // Primeiro verifica se está versionada
+    return this.isReleaseVersioned(release).pipe(
+      switchMap(isVersioned => {
+        if (!isVersioned) {
+          return of(false); // Se não está versionada, não tem commits pendentes
+        }
+
+        // Se está versionada, verifica se o arquivo na feature/upsert-release é diferente do develop (não mergeado)
+        const checks = release.repositories.map(repo => {
+          const repoInfo = this.githubService.parseRepositoryUrl(repo.url);
+          if (!repoInfo) {
+            return of(false);
+          }
+
+          const releaseFilePath = `releases/release_${release.demandId}.md`;
+          
+          // Busca SHA do arquivo em ambas as branches
+          const developSha$ = this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, releaseFilePath, 'develop');
+          const upsertSha$ = this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, releaseFilePath, this.UPSERT_BRANCH);
+          
+          return forkJoin([developSha$, upsertSha$]).pipe(
+            map(([developSha, upsertSha]) => {
+              // Tem commits pendentes se o arquivo existe na upsert e é diferente do develop
+              return upsertSha !== null && developSha !== null && upsertSha !== developSha;
+            }),
+            catchError(() => of(false))
+          );
+        });
+
+        return forkJoin(checks).pipe(
+          map(results => results.some(hasPending => hasPending === true))
+        );
+      })
     );
   }
 }

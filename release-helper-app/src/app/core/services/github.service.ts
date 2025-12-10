@@ -553,9 +553,9 @@ export class GitHubService {
   }
 
   /**
-   * Lista arquivos de release no diretório releases/ da branch develop
+   * Lista arquivos de release no diretório releases/ de uma branch específica
    */
-  listReleasesFromRepo(owner: string, repo: string): Observable<{ name: string; path: string; sha: string }[]> {
+  listReleasesFromRepo(owner: string, repo: string, branch: string = 'develop'): Observable<{ name: string; path: string; sha: string; branch: string }[]> {
     const octokit = this.getOctokit();
     if (!octokit) {
       console.error(`[listReleasesFromRepo] Sem token para ${owner}/${repo}`);
@@ -567,7 +567,7 @@ export class GitHubService {
         owner,
         repo,
         path: 'releases',
-        ref: 'develop'
+        ref: branch
       })
     ).pipe(
       map(response => {
@@ -577,14 +577,15 @@ export class GitHubService {
             .map((file: any) => ({
               name: file.name,
               path: file.path,
-              sha: file.sha
+              sha: file.sha,
+              branch: branch
             }));
           return files;
         }
         return [];
       }),
       catchError(error => {
-        console.error(`[listReleasesFromRepo] Erro em ${owner}/${repo}:`, error.status, error.message);
+        console.error(`[listReleasesFromRepo] Erro em ${owner}/${repo} (branch ${branch}):`, error.status, error.message);
         // 404 = pasta releases não existe ou branch não existe
         if (error.status === 404) {
           return of([]);
@@ -595,16 +596,17 @@ export class GitHubService {
   }
 
   /**
-   * Obtém o conteúdo de um arquivo de release
+   * Obtém o conteúdo de um arquivo de release de uma branch específica
    */
-  getReleaseFileContent(owner: string, repo: string, path: string): Observable<string | null> {
-    return this.getFileContent(owner, repo, path, 'develop');
+  getReleaseFileContent(owner: string, repo: string, path: string, branch: string = 'develop'): Observable<string | null> {
+    return this.getFileContent(owner, repo, path, branch);
   }
 
   /**
    * Lista todas as releases de todos os repositórios acessíveis
+   * Busca tanto na branch develop (versionadas) quanto na branch feature/upsert-release (não versionadas)
    */
-  listAllReleasesFromRepos(): Observable<{ repo: string; releases: { name: string; path: string; sha: string }[] }[]> {
+  listAllReleasesFromRepos(): Observable<{ repo: string; releases: { name: string; path: string; sha: string; branch: string }[] }[]> {
     return this.getUserRepositories().pipe(
       switchMap(repos => {
         if (repos.length === 0) {
@@ -615,16 +617,28 @@ export class GitHubService {
           const repoInfo = this.parseRepositoryUrl(repo.html_url);
           if (!repoInfo) {
             console.error(`[listAllReleasesFromRepos] Não foi possível parsear URL: ${repo.html_url}`);
-            return of({ repo: repo.full_name, releases: [] as { name: string; path: string; sha: string }[] });
+            return of({ repo: repo.full_name, releases: [] as { name: string; path: string; sha: string; branch: string }[] });
           }
           
-          return this.listReleasesFromRepo(repoInfo.owner, repoInfo.repo).pipe(
-            map(releases => {
-              return { repo: repo.full_name, releases };
+          // Busca releases na branch develop (versionadas)
+          const developReleases$ = this.listReleasesFromRepo(repoInfo.owner, repoInfo.repo, 'develop').pipe(
+            catchError(() => of([]))
+          );
+          
+          // Busca releases na branch feature/upsert-release (não versionadas)
+          const upsertReleases$ = this.listReleasesFromRepo(repoInfo.owner, repoInfo.repo, 'feature/upsert-release').pipe(
+            catchError(() => of([]))
+          );
+          
+          return forkJoin([developReleases$, upsertReleases$]).pipe(
+            map(([developReleases, upsertReleases]) => {
+              // Combina releases de ambas as branches
+              const allReleases = [...developReleases, ...upsertReleases];
+              return { repo: repo.full_name, releases: allReleases };
             }),
             catchError(err => {
               console.error(`[listAllReleasesFromRepos] Erro em ${repo.full_name}:`, err);
-              return of({ repo: repo.full_name, releases: [] as { name: string; path: string; sha: string }[] });
+              return of({ repo: repo.full_name, releases: [] as { name: string; path: string; sha: string; branch: string }[] });
             })
           );
         });
@@ -634,6 +648,169 @@ export class GitHubService {
       map(results => {
         return results.filter(r => r.releases.length > 0);
       })
+    );
+  }
+
+  /**
+   * Busca informações do último commit de um arquivo em uma branch específica
+   * Retorna o autor do commit (login do GitHub)
+   */
+  getFileLastCommit(owner: string, repo: string, path: string, branch: string = 'develop'): Observable<{ author: string; date: Date } | null> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    return from(
+      octokit.repos.listCommits({
+        owner,
+        repo,
+        path,
+        sha: branch,
+        per_page: 1
+      })
+    ).pipe(
+      map((response: any) => {
+        if (response.data.length === 0) {
+          return null;
+        }
+        const commit = response.data[0];
+        const author = commit.author?.login || commit.commit?.author?.name || null;
+        const date = commit.commit?.author?.date ? new Date(commit.commit.author.date) : new Date();
+        
+        if (!author) {
+          return null;
+        }
+        
+        return { author, date };
+      }),
+      catchError((error: any) => {
+        if (error.status === 404) {
+          return of(null);
+        }
+        console.error('Erro ao buscar commit do arquivo:', error);
+        return of(null);
+      })
+    );
+  }
+
+  /**
+   * Busca informações do primeiro commit de um arquivo em uma branch específica
+   * Retorna o autor do commit (login do GitHub)
+   * Nota: A API do GitHub retorna commits do mais recente para o mais antigo.
+   * Busca até 10 páginas para encontrar o commit mais antigo.
+   */
+  getFileFirstCommit(owner: string, repo: string, path: string, branch: string = 'develop'): Observable<{ author: string; date: Date } | null> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    // Busca commits paginados até encontrar todos (ou até 10 páginas)
+    const fetchAllCommits = async (page: number = 1, allCommits: any[] = []): Promise<any[]> => {
+      try {
+        const response = await octokit.repos.listCommits({
+          owner,
+          repo,
+          path,
+          sha: branch,
+          per_page: 100,
+          page
+        });
+
+        if (response.data.length === 0) {
+          return allCommits;
+        }
+
+        allCommits = [...allCommits, ...response.data];
+
+        // Se retornou menos de 100, chegou ao fim
+        if (response.data.length < 100 || page >= 10) {
+          return allCommits;
+        }
+
+        // Continua buscando na próxima página
+        return fetchAllCommits(page + 1, allCommits);
+      } catch (error) {
+        const err = error as { status?: number };
+        if (err.status === 404) {
+          return allCommits;
+        }
+        throw error;
+      }
+    };
+
+    return from(fetchAllCommits()).pipe(
+      map((commits: any[]) => {
+        if (commits.length === 0) {
+          return null;
+        }
+        // Pega o último commit da lista (que é o primeiro commit do arquivo, mais antigo)
+        const commit = commits[commits.length - 1];
+        const author = commit.author?.login || commit.commit?.author?.name || null;
+        const date = commit.commit?.author?.date ? new Date(commit.commit.author.date) : new Date();
+        
+        if (!author) {
+          return null;
+        }
+        
+        return { author, date };
+      }),
+      catchError((error: any) => {
+        if (error.status === 404) {
+          return of(null);
+        }
+        console.error('Erro ao buscar primeiro commit do arquivo:', error);
+        return of(null);
+      })
+    );
+  }
+
+  /**
+   * Lista commits de uma branch específica
+   * Filtra apenas commits que começam com "docs:"
+   */
+  listBranchCommits(owner: string, repo: string, branch: string, perPage: number = 30): Observable<Array<{ sha: string; message: string; author: string; date: Date; url: string }>> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    return from(
+      octokit.repos.listCommits({
+        owner,
+        repo,
+        sha: branch,
+        per_page: perPage
+      })
+    ).pipe(
+      map((response: any) => {
+        return response.data
+          .map((commit: any) => ({
+            sha: commit.sha.substring(0, 7),
+            message: commit.commit.message.split('\n')[0], // Primeira linha da mensagem
+            author: commit.author?.login || commit.commit?.author?.name || 'Unknown',
+            date: new Date(commit.commit.author.date),
+            url: commit.html_url
+          }))
+          .filter((commit: { message: string }) => commit.message.toLowerCase().startsWith('docs:'));
+      }),
+      catchError((error: any) => {
+        if (error.status === 404) {
+          return of([]); // Branch não existe
+        }
+        console.error('Erro ao listar commits da branch:', error);
+        return of([]);
+      })
+    );
+  }
+
+  /**
+   * Conta commits com "docs:" em uma branch específica
+   */
+  countDocsCommits(owner: string, repo: string, branch: string): Observable<number> {
+    return this.listBranchCommits(owner, repo, branch, 100).pipe(
+      map(commits => commits.length)
     );
   }
 
