@@ -62,8 +62,8 @@ export class ReleaseService {
     if (user) {
       return user.login;
     }
-    // Tenta obter do sessionStorage (usuário funcional)
-    const serviceUserStr = sessionStorage.getItem('service_user');
+    // Tenta obter do localStorage (usuário funcional)
+    const serviceUserStr = localStorage.getItem('service_user');
     if (serviceUserStr) {
       try {
         const serviceUser = JSON.parse(serviceUserStr);
@@ -719,6 +719,52 @@ export class ReleaseService {
         return forkJoin(checks).pipe(
           map(results => results.some(hasPending => hasPending === true))
         );
+      })
+    );
+  }
+
+  /**
+   * Desfaz a última edição de uma release (undo commit)
+   * Restaura os arquivos para o estado anterior ao último commit de edição
+   */
+  revertPendingCommits(release: Release): Observable<{ success: boolean; errors: string[] }> {
+    if (!release.repositories || release.repositories.length === 0) {
+      return of({ success: false, errors: ['Release não tem repositórios associados'] });
+    }
+
+    if (!this.githubService.hasValidToken()) {
+      return of({ success: false, errors: ['Token GitHub não disponível'] });
+    }
+
+    const errors: string[] = [];
+    const operations = release.repositories.map(repo => {
+      const repoInfo = this.githubService.parseRepositoryUrl(repo.url);
+      if (!repoInfo) {
+        errors.push(`URL inválida: ${repo.url}`);
+        return of({ success: false, repo: repo.url });
+      }
+
+      const { owner, repo: repoName } = repoInfo;
+      const releaseFilePath = `releases/release_${release.demandId}.md`;
+
+      // Desfaz o último commit do arquivo de release
+      // Por enquanto, reverte apenas o arquivo de release para evitar múltiplos commits
+      // Os scripts geralmente não são editados separadamente, então não precisam ser revertidos
+      return this.githubService.undoLastCommit(owner, repoName, releaseFilePath, this.UPSERT_BRANCH, release.demandId).pipe(
+        map(() => ({ success: true, repo: repoName })),
+        catchError(err => {
+          const errorMsg = `Erro ao reverter commits em ${repoName}: ${err.message || err}`;
+          errors.push(errorMsg);
+          console.error(errorMsg, err);
+          return of({ success: false, repo: repoName });
+        })
+      );
+    });
+
+    return forkJoin(operations).pipe(
+      map(results => {
+        const allSuccess = results.every(r => r.success);
+        return { success: allSuccess, errors };
       })
     );
   }

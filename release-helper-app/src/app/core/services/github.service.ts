@@ -75,10 +75,10 @@ export class GitHubService {
   }
 
   /**
-   * Inicializa Octokit com token de serviço da sessão
+   * Inicializa Octokit com token de serviço do localStorage
    */
   private initializeFromServiceToken(): void {
-    const serviceToken = sessionStorage.getItem('service_token');
+    const serviceToken = localStorage.getItem('service_token');
     if (serviceToken) {
       this.octokit = new Octokit({ auth: serviceToken });
     } else {
@@ -108,7 +108,7 @@ export class GitHubService {
    * Verifica se está usando token de serviço
    */
   isUsingServiceToken(): boolean {
-    return !this.authService.isAuthenticated() && !!sessionStorage.getItem('service_token');
+    return !this.authService.isAuthenticated() && !!localStorage.getItem('service_token');
   }
 
   /**
@@ -396,6 +396,34 @@ export class GitHubService {
           return of(void 0);
         }
         console.error('Erro ao criar branch:', error);
+        return throwError(() => error);
+      })
+    );
+  }
+
+  /**
+   * Deleta uma branch
+   */
+  deleteBranch(owner: string, repo: string, branchName: string): Observable<void> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    return from(
+      octokit.git.deleteRef({
+        owner,
+        repo,
+        ref: `heads/${branchName}`
+      })
+    ).pipe(
+      map(() => void 0),
+      catchError((error: any) => {
+        // Se a branch não existe, não é um erro
+        if (error.status === 404 || error.status === 422) {
+          return of(void 0);
+        }
+        console.error('Erro ao deletar branch:', error);
         return throwError(() => error);
       })
     );
@@ -815,6 +843,104 @@ export class GitHubService {
   }
 
   /**
+   * Lista commits docs: de uma branch que NÃO existem na develop
+   * Retorna apenas commits que estão na branch mas não na develop
+   */
+  listCommitsNotInDevelop(owner: string, repo: string, branch: string, perPage: number = 100): Observable<Array<{ sha: string; message: string; author: string; date: Date; url: string }>> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    // Busca commits docs: de ambas as branches com SHA completo
+    const branchCommits$ = from(
+      octokit.repos.listCommits({
+        owner,
+        repo,
+        sha: branch,
+        per_page: perPage
+      })
+    ).pipe(
+      map((response: any) => {
+        return response.data
+          .map((commit: any) => ({
+            sha: commit.sha, // SHA completo
+            shaShort: commit.sha.substring(0, 7), // SHA curto para exibição
+            message: commit.commit.message.split('\n')[0],
+            author: commit.author?.login || commit.commit?.author?.name || 'Unknown',
+            date: new Date(commit.commit.author.date),
+            url: commit.html_url
+          }))
+          .filter((commit: { message: string }) => commit.message.toLowerCase().startsWith('docs:'));
+      }),
+      catchError((error: any) => {
+        if (error.status === 404) {
+          return of([]);
+        }
+        console.error('Erro ao listar commits da branch:', error);
+        return of([]);
+      })
+    );
+
+    const developCommits$ = from(
+      octokit.repos.listCommits({
+        owner,
+        repo,
+        sha: 'develop',
+        per_page: perPage
+      })
+    ).pipe(
+      map((response: any) => {
+        // Filtra apenas commits docs: e retorna apenas os SHAs completos
+        return response.data
+          .filter((commit: any) => {
+            const message = commit.commit.message.split('\n')[0];
+            return message.toLowerCase().startsWith('docs:');
+          })
+          .map((commit: any) => commit.sha); // Apenas SHA completo para comparação
+      }),
+      catchError((error: any) => {
+        if (error.status === 404) {
+          return of([]);
+        }
+        console.error('Erro ao listar commits da develop:', error);
+        return of([]);
+      })
+    );
+
+    return forkJoin([branchCommits$, developCommits$]).pipe(
+      map(([branchCommits, developShas]) => {
+        // Cria um Set com os SHAs completos dos commits da develop para busca rápida
+        const developShasSet = new Set(developShas);
+        
+        // Filtra apenas commits da branch que não estão na develop
+        return branchCommits
+          .filter((commit: { sha: string; shaShort: string; message: string; author: string; date: Date; url: string }) => !developShasSet.has(commit.sha))
+          .map((commit: { sha: string; shaShort: string; message: string; author: string; date: Date; url: string }) => ({
+            sha: commit.shaShort, // Retorna SHA curto para exibição
+            message: commit.message,
+            author: commit.author,
+            date: commit.date,
+            url: commit.url
+          }));
+      }),
+      catchError((error: any) => {
+        console.error('Erro ao comparar commits entre branches:', error);
+        return of([]);
+      })
+    );
+  }
+
+  /**
+   * Conta commits docs: de uma branch que NÃO existem na develop
+   */
+  countCommitsNotInDevelop(owner: string, repo: string, branch: string): Observable<number> {
+    return this.listCommitsNotInDevelop(owner, repo, branch, 100).pipe(
+      map(commits => commits.length)
+    );
+  }
+
+  /**
    * Deleta um arquivo do repositório
    */
   deleteFile(owner: string, repo: string, path: string, message: string, branch: string = 'develop'): Observable<void> {
@@ -846,6 +972,221 @@ export class GitHubService {
         return throwError(() => error);
       })
     );
+  }
+
+  /**
+   * Desfaz o último commit relacionado à release (undo commit)
+   * Se houver apenas 1 commit pendente e o estado for igual à develop, deleta a branch
+   * Caso contrário, apenas desfaz o último commit
+   */
+  undoLastCommit(owner: string, repo: string, path: string, branch: string = 'feature/upsert-release', demandId: string): Observable<void> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    // 1. Verifica quantos commits pendentes existem relacionados à release (que não estão na develop)
+    // Busca commits da branch e filtra apenas os relacionados à release
+    return from(
+      octokit.repos.listCommits({
+        owner,
+        repo,
+        sha: branch,
+        per_page: 100
+      })
+    ).pipe(
+      map((response: any) => {
+        // Filtra apenas commits docs: relacionados à release
+        const demandIdLower = demandId.toLowerCase();
+        return response.data.filter((commit: any) => {
+          const message = commit.commit.message.split('\n')[0].toLowerCase();
+          const isDocsCommit = message.startsWith('docs:');
+          const mentionsDemandId = message.includes(demandIdLower);
+          // Verifica se menciona atualiza/cria release com o demandId
+          const isReleaseCommit = mentionsDemandId && (
+            message.includes('atualiza release') || 
+            message.includes('cria release') ||
+            message.includes('update release') ||
+            message.includes('create release')
+          );
+          return isDocsCommit && isReleaseCommit;
+        });
+      }),
+      switchMap((releaseCommits: any[]) => {
+        // 2. Verifica quais desses commits não estão na develop
+        const developCommits$ = from(
+          octokit.repos.listCommits({
+            owner,
+            repo,
+            sha: 'develop',
+            per_page: 100
+          })
+        ).pipe(
+          map((response: any) => {
+            return response.data
+              .filter((commit: any) => {
+                const message = commit.commit.message.split('\n')[0].toLowerCase();
+                return message.startsWith('docs:');
+              })
+              .map((commit: any) => commit.sha);
+          }),
+          catchError(() => of([]))
+        );
+
+        return developCommits$.pipe(
+          switchMap((developShas) => {
+            const developShasSet = new Set(developShas);
+            // Filtra commits da release que não estão na develop
+            const pendingReleaseCommits = releaseCommits.filter(commit => 
+              !developShasSet.has(commit.sha)
+            );
+
+            // 3. Verifica o conteúdo atual do arquivo na branch e na develop
+            const currentContent$ = this.getFileContent(owner, repo, path, branch);
+            const developContent$ = this.getFileContent(owner, repo, path, 'develop');
+
+            return forkJoin([currentContent$, developContent$]).pipe(
+              switchMap(([currentContent, developContent]) => {
+                // 4. Se há apenas 1 commit pendente relacionado à release E o conteúdo atual é igual ao da develop, deleta a branch
+                const hasOnlyOneCommit = pendingReleaseCommits.length === 1;
+                const isEqualToDevelop = currentContent === developContent;
+
+                if (hasOnlyOneCommit && isEqualToDevelop) {
+                  // Deleta a branch inteira pois não há mais nada para versionar
+                  return this.deleteBranch(owner, repo, branch);
+                }
+
+                // 5. Caso contrário, apenas desfaz o último commit
+                if (releaseCommits.length === 0) {
+                  // Não há commits relacionados à release, nada a fazer
+                  return of(void 0);
+                }
+
+                // O primeiro commit é o mais recente - este é o commit que queremos desfazer
+                const lastCommit = releaseCommits[0];
+                const lastCommitSha = lastCommit.sha;
+
+                // Busca o commit anterior (pai do último commit)
+                let previousCommitSha: string | null = null;
+                if (lastCommit.parents && lastCommit.parents.length > 0) {
+                  previousCommitSha = lastCommit.parents[0].sha;
+                }
+
+                // Busca o conteúdo do arquivo no commit anterior (ou develop se não houver parent)
+                const contentSource$ = previousCommitSha 
+                  ? this.getFileContent(owner, repo, path, previousCommitSha)
+                  : this.getFileContent(owner, repo, path, 'develop');
+
+                return contentSource$.pipe(
+                  switchMap((previousContent: string | null) => {
+                    return this.getFileSha(owner, repo, path, branch).pipe(
+                      switchMap((currentSha: string | null) => {
+                        // Se não há conteúdo anterior e não há arquivo atual, nada a fazer
+                        if (!previousContent && !currentSha) {
+                          return of(void 0);
+                        }
+
+                        // Se não há conteúdo anterior mas há arquivo atual, remove o arquivo
+                        if (!previousContent && currentSha) {
+                          return from(
+                            octokit.repos.deleteFile({
+                              owner,
+                              repo,
+                              path,
+                              message: `docs: desfaz última edição de release ${demandId}`,
+                              sha: currentSha,
+                              branch
+                            })
+                          ).pipe(
+                            map(() => void 0),
+                            catchError(error => {
+                              console.error('Erro ao remover arquivo:', error);
+                              return throwError(() => error);
+                            })
+                          );
+                        }
+
+                        // Restaura para o estado do commit anterior
+                        const fileContent = this.encodeBase64UTF8(previousContent!);
+                        const message = `docs: desfaz última edição de release ${demandId}`;
+
+                        return from(
+                          octokit.repos.createOrUpdateFileContents({
+                            owner,
+                            repo,
+                            path,
+                            message,
+                            content: fileContent,
+                            branch,
+                            ...(currentSha ? { sha: currentSha } : {})
+                          })
+                        ).pipe(
+                          map(() => void 0),
+                          catchError(error => {
+                            console.error('Erro ao desfazer commit:', error);
+                            return throwError(() => error);
+                          })
+                        );
+                      })
+                    );
+                  }),
+                  catchError(error => {
+                    // Se não conseguiu buscar do commit anterior, tenta da develop
+                    console.warn('Erro ao buscar commit anterior, tentando develop:', error);
+                    return this.getFileContent(owner, repo, path, 'develop').pipe(
+                      switchMap((developContent: string | null) => {
+                        return this.getFileSha(owner, repo, path, branch).pipe(
+                          switchMap((currentSha: string | null) => {
+                            if (!developContent || !currentSha) {
+                              return of(void 0);
+                            }
+
+                            const fileContent = this.encodeBase64UTF8(developContent);
+                            const message = `docs: desfaz última edição de release ${demandId}`;
+
+                            return from(
+                              octokit.repos.createOrUpdateFileContents({
+                                owner,
+                                repo,
+                                path,
+                                message,
+                                content: fileContent,
+                                branch,
+                                sha: currentSha
+                              })
+                            ).pipe(
+                              map(() => void 0),
+                              catchError(err => {
+                                console.error('Erro ao desfazer commit:', err);
+                                return throwError(() => err);
+                              })
+                            );
+                          })
+                        );
+                      })
+                    );
+                  })
+                );
+              })
+            );
+          })
+        );
+      }),
+      catchError(error => {
+        console.error('Erro ao desfazer commit:', error);
+        return throwError(() => error);
+      })
+    );
+  }
+
+  /**
+   * Reverte commits pendentes de um arquivo, restaurando-o para o estado da develop
+   * Isso efetivamente "desfaz" as alterações pendentes na branch feature/upsert-release
+   * @deprecated Use undoLastCommit para desfazer a última edição
+   */
+  revertPendingCommits(owner: string, repo: string, path: string, branch: string = 'feature/upsert-release', demandId: string): Observable<void> {
+    // Redireciona para undoLastCommit para manter compatibilidade
+    return this.undoLastCommit(owner, repo, path, branch, demandId);
   }
 }
 

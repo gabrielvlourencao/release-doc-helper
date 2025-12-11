@@ -22,7 +22,7 @@ export interface ConfirmDialogData {
            (click)="$event.stopPropagation()">
         <div class="p-6">
           <h2 class="text-xl font-semibold text-slate-900 mb-2">{{ data.title }}</h2>
-          <p class="text-slate-600">{{ data.message }}</p>
+          <p class="text-slate-600 whitespace-pre-line">{{ data.message }}</p>
         </div>
         <div class="flex justify-end gap-3 px-6 py-4 bg-slate-50 rounded-b-2xl">
           <button class="btn-secondary" (click)="onCancel()">

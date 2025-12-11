@@ -137,17 +137,51 @@ export class LoginComponent implements OnInit {
     private route: ActivatedRoute
   ) {}
 
+  /**
+   * Migra dados do sessionStorage para localStorage (compatibilidade com versões antigas)
+   */
+  private migrateFromSessionStorage(): void {
+    // Se já tem no localStorage, não precisa migrar
+    if (localStorage.getItem('service_token')) {
+      return;
+    }
+
+    // Migra do sessionStorage para localStorage
+    const sessionToken = sessionStorage.getItem('service_token');
+    const sessionMode = sessionStorage.getItem('user_mode');
+    const sessionUser = sessionStorage.getItem('service_user');
+
+    if (sessionToken) {
+      localStorage.setItem('service_token', sessionToken);
+      sessionStorage.removeItem('service_token');
+    }
+
+    if (sessionMode) {
+      localStorage.setItem('user_mode', sessionMode);
+      sessionStorage.removeItem('user_mode');
+    }
+
+    if (sessionUser) {
+      localStorage.setItem('service_user', sessionUser);
+      sessionStorage.removeItem('service_user');
+    }
+  }
+
   ngOnInit(): void {
     // Verifica se já está autenticado com GitHub
     if (this.authService.isAuthenticated()) {
-      sessionStorage.setItem('user_mode', 'developer');
+      localStorage.setItem('user_mode', 'developer');
       this.router.navigate(['/home']);
       return;
     }
 
+    // Migra de sessionStorage para localStorage se necessário
+    this.migrateFromSessionStorage();
+
     // Verifica se já está no modo funcional com token válido
-    const userMode = sessionStorage.getItem('user_mode');
-    const savedToken = sessionStorage.getItem('service_token');
+    
+    const userMode = localStorage.getItem('user_mode');
+    const savedToken = localStorage.getItem('service_token');
     if (userMode === 'functional' && savedToken) {
       this.router.navigate(['/home']);
       return;
@@ -159,7 +193,7 @@ export class LoginComponent implements OnInit {
 
   loginAsDeveloper(): void {
     this.isLoading = true;
-    sessionStorage.setItem('user_mode', 'developer');
+    localStorage.setItem('user_mode', 'developer');
     this.authService.login();
   }
 
@@ -187,10 +221,10 @@ export class LoginComponent implements OnInit {
 
       const user = await response.json();
       
-      // Salva o token e o modo na sessão
-      sessionStorage.setItem('user_mode', 'functional');
-      sessionStorage.setItem('service_token', this.serviceToken);
-      sessionStorage.setItem('service_user', JSON.stringify({
+      // Salva o token e o modo no localStorage para persistir entre sessões
+      localStorage.setItem('user_mode', 'functional');
+      localStorage.setItem('service_token', this.serviceToken);
+      localStorage.setItem('service_user', JSON.stringify({
         login: user.login,
         avatar_url: user.avatar_url
       }));

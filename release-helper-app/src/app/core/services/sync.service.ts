@@ -433,8 +433,8 @@ export class SyncService {
     if (user) {
       return user.login;
     }
-    // Tenta obter do sessionStorage (usuário funcional)
-    const serviceUserStr = sessionStorage.getItem('service_user');
+    // Tenta obter do localStorage (usuário funcional)
+    const serviceUserStr = localStorage.getItem('service_user');
     if (serviceUserStr) {
       try {
         const serviceUser = JSON.parse(serviceUserStr);

@@ -33,6 +33,13 @@ export class VersioningService {
   ) {}
 
   /**
+   * Obtém lista de PRs abertos relacionados a releases
+   */
+  getOpenPRs(): Observable<Array<{ repo: string; title: string; url: string; number: number; demandId?: string }>> {
+    return this.githubService.getOpenReleasePRs();
+  }
+
+  /**
    * Versiona uma release nos repositórios selecionados
    * Cria branch, arquivos e Pull Request
    */

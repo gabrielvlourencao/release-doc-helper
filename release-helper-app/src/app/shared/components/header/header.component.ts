@@ -34,6 +34,15 @@ import { takeUntil } from 'rxjs/operators';
             Demandas
           </a>
           
+          <a routerLink="/metrics" 
+             routerLinkActive="bg-slate-100 text-primary-500"
+             class="px-4 py-2 rounded-lg text-slate-600 hover:bg-slate-50 font-medium text-sm transition-colors flex items-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+            </svg>
+            Métricas
+          </a>
+          
           <a routerLink="/releases/new" 
              class="ml-2 btn-primary text-sm">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -129,7 +138,7 @@ export class HeaderComponent implements OnInit, OnDestroy {
     
     // Se não tem usuário OAuth, verifica se é funcional
     if (!this.user) {
-      const serviceUserStr = sessionStorage.getItem('service_user');
+      const serviceUserStr = localStorage.getItem('service_user');
       if (serviceUserStr) {
         try {
           this.serviceUser = JSON.parse(serviceUserStr);
@@ -157,18 +166,18 @@ export class HeaderComponent implements OnInit, OnDestroy {
   handleLogout(): void {
     // Limpa autenticação GitHub OAuth
     this.authService.logout();
-    // Limpa dados de funcional
-    sessionStorage.removeItem('user_mode');
-    sessionStorage.removeItem('service_token');
-    sessionStorage.removeItem('service_user');
+    // Limpa dados de funcional do localStorage
+    localStorage.removeItem('user_mode');
+    localStorage.removeItem('service_token');
+    localStorage.removeItem('service_user');
     this.router.navigate(['/auth/login']);
   }
 
   goToLogin(): void {
     // Limpa tudo para permitir escolher novamente
-    sessionStorage.removeItem('user_mode');
-    sessionStorage.removeItem('service_token');
-    sessionStorage.removeItem('service_user');
+    localStorage.removeItem('user_mode');
+    localStorage.removeItem('service_token');
+    localStorage.removeItem('service_user');
     this.router.navigate(['/auth/login']);
   }
 }

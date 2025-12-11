@@ -6,7 +6,7 @@ import { GitHubAuthService } from '../services/github-auth.service';
  * Guard para proteger rotas que requerem autenticação
  * Permite acesso se:
  * - Usuário está logado com GitHub (developer)
- * - Usuário está com token de serviço na sessão (funcional)
+ * - Usuário está com token de serviço no localStorage (funcional)
  */
 @Injectable({
   providedIn: 'root'
@@ -27,8 +27,8 @@ export class AuthGuard implements CanActivate {
       return true;
     }
 
-    // Verifica se há token de serviço na sessão (funcional)
-    const serviceToken = sessionStorage.getItem('service_token');
+    // Verifica se há token de serviço no localStorage (funcional)
+    const serviceToken = localStorage.getItem('service_token');
     if (serviceToken) {
       return true;
     }

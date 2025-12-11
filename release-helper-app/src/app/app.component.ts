@@ -46,10 +46,10 @@ export class AppComponent implements OnInit {
     
     // Mostra header se:
     // 1. Usuário está autenticado com GitHub OAuth, ou
-    // 2. Usuário tem token de serviço na sessão (funcional)
+    // 2. Usuário tem token de serviço no localStorage (funcional)
     // E não está na rota de login/callback
     const isDeveloper = this.authService.isAuthenticated();
-    const hasServiceToken = !!sessionStorage.getItem('service_token');
+    const hasServiceToken = !!localStorage.getItem('service_token');
     const hasAccess = isDeveloper || hasServiceToken;
     this.showHeader = hasAccess && !isAuthRoute;
   }
