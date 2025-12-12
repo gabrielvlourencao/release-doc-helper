@@ -178,8 +178,11 @@ export class ReleaseService {
   /**
    * Atualiza release existente no localStorage e cria commit na branch feature/upsert-release
    * Quando uma release é editada, ela é marcada como não versionada
+   * 
+   * IMPORTANTE: Cria commits APENAS quando é uma edição manual do usuário.
+   * NÃO cria commits durante sincronização (syncFromGitHub usa localStorageReleaseService diretamente).
    */
-  update(id: string, changes: Partial<Release>): Observable<Release | null> {
+  update(id: string, changes: Partial<Release>, skipCommit: boolean = false): Observable<Release | null> {
     // Busca a release no localStorage
     return this.releases$.pipe(
       take(1),
@@ -193,6 +196,16 @@ export class ReleaseService {
 
         const currentUser = this.getCurrentUserLogin();
         const wasVersioned = release.isVersioned ?? false;
+        
+        // Verifica se realmente houve mudança de conteúdo (não apenas metadata)
+        const hasContentChanged = 
+          (changes.title !== undefined && changes.title !== release.title) ||
+          (changes.description !== undefined && changes.description !== release.description) ||
+          (changes.responsible !== undefined && JSON.stringify(changes.responsible) !== JSON.stringify(release.responsible)) ||
+          (changes.secrets !== undefined && JSON.stringify(changes.secrets) !== JSON.stringify(release.secrets)) ||
+          (changes.scripts !== undefined && JSON.stringify(changes.scripts) !== JSON.stringify(release.scripts)) ||
+          (changes.observations !== undefined && changes.observations !== release.observations) ||
+          (changes.repositories !== undefined && JSON.stringify(changes.repositories) !== JSON.stringify(release.repositories));
         
         const updatedRelease: Release = {
           ...release,
@@ -208,7 +221,24 @@ export class ReleaseService {
         // Atualiza no localStorage
         return this.localStorageReleaseService.syncRelease(updatedRelease).pipe(
           switchMap(() => {
-            // Se tem repositórios e token GitHub, cria commit na branch feature/upsert-release
+            // REGRA CRÍTICA: Só cria commits se:
+            // 1. skipCommit é false (não é sincronização)
+            // 2. REALMENTE mudou o conteúdo (não apenas metadata como isVersioned, updatedAt, etc)
+            // 3. Tem repositórios
+            // 4. Tem token GitHub
+            
+            // Se skipCommit é true, NÃO cria commits (usado durante sincronização)
+            if (skipCommit) {
+              return of(updatedRelease);
+            }
+            
+            // Se não mudou conteúdo, NÃO cria commits
+            // (evita commits quando apenas atualiza flags ou metadata)
+            if (!hasContentChanged) {
+              return of(updatedRelease);
+            }
+            
+            // Se tem repositórios e token GitHub E mudou conteúdo, cria commit
             if (updatedRelease.repositories && updatedRelease.repositories.length > 0 && this.githubService.hasValidToken()) {
               return this.commitToUpsertBranch(updatedRelease, 'update').pipe(
                 map(() => updatedRelease),
@@ -489,26 +519,77 @@ export class ReleaseService {
         if (parts.length >= 2) {
           const role = parts[0].toLowerCase();
           const name = parts[1];
-          if (role.includes('dev')) responsible.dev = name;
-          if (role.includes('funcional')) responsible.functional = name;
-          if (role.includes('lt')) responsible.lt = name;
-          if (role.includes('sre')) responsible.sre = name;
+          if (role.includes('dev')) responsible.dev = name === '-' ? '' : name;
+          if (role.includes('funcional')) responsible.functional = name === '-' ? '' : name;
+          if (role.includes('lt')) responsible.lt = name === '-' ? '' : name;
+          if (role.includes('sre')) responsible.sre = name === '-' ? '' : name;
         }
       }
       
-      if (currentSection === 'observations' && line && !line.startsWith('#') && !line.startsWith('---')) {
+      // Parse de secrets e scripts será feito depois do loop usando regex (mais robusto)
+      
+      // Parse tabela de repositórios (## 5. Projetos Impactados)
+      if (currentSection === 'repositories' && line.startsWith('|') && !line.includes('Repositório') && !line.includes('---')) {
+        const parts = line.split('|').map(p => p.trim()).filter(p => p);
+        if (parts.length >= 2) {
+          const repoUrl = parts[0] || '';
+          const impact = parts[1] || '';
+          const branch = parts.length >= 3 ? (parts[2] || 'develop') : 'develop';
+          
+          if (repoUrl && repoUrl.includes('github.com')) {
+            // Verifica se já não existe
+            const repoName = repoUrl.replace(/https?:\/\/github.com\//, '').replace(/\/$/, '');
+            if (!repositories.some(r => r.url === repoUrl || r.name === repoName)) {
+              repositories.push({
+                id: `repo-${repositories.length + 1}`,
+                url: repoUrl,
+                name: repoName,
+                impact: impact || 'Release sincronizada do GitHub',
+                releaseBranch: branch
+              });
+            }
+          }
+        }
+      }
+      
+      if (currentSection === 'observations' && line && !line.startsWith('#') && !line.startsWith('---') && !line.startsWith('*Documento gerado')) {
         observations += (observations ? '\n' : '') + line;
       }
     }
 
-    // Adiciona o repo de origem
+    // Parse tabelas usando regex (mais robusto que linha por linha)
+    const parsedSecrets = this.parseSecretsTableFromMarkdown(markdown);
+    const parsedScripts = this.parseScriptsTableFromMarkdown(markdown, demandId);
+    const parsedObservations = this.parseObservationsFromMarkdown(markdown);
+    
+    // Usa os dados parseados por regex se encontrou
+    if (parsedSecrets.length > 0) {
+      secrets.length = 0; // Limpa e usa os parseados
+      secrets.push(...parsedSecrets);
+    }
+    
+    if (parsedScripts.length > 0) {
+      scripts.length = 0; // Limpa e usa os parseados
+      scripts.push(...parsedScripts);
+    }
+    
+    // Usa observações parseadas por regex se encontrou (mais robusto)
+    if (parsedObservations) {
+      observations = parsedObservations;
+    }
+
+    // Adiciona o repo de origem apenas se não existe na lista
+    const repoExists = repositories.some(r => r.url.includes(repoFullName) || r.name === repoFullName);
+    if (!repoExists) {
     repositories.push({
       id: `repo-${Date.now()}`,
       url: `https://github.com/${repoFullName}`,
       name: repoFullName,
-      impact: 'Origem do documento',
+        impact: 'Release sincronizada do GitHub',
       releaseBranch: 'develop'
-    });
+      });
+    }
+
 
     return {
       demandId,
@@ -520,6 +601,159 @@ export class ReleaseService {
       repositories,
       observations
     };
+  }
+
+  /**
+   * Parse da tabela de secrets usando regex (mais robusto)
+   */
+  private parseSecretsTableFromMarkdown(content: string): ReleaseSecret[] {
+    const secrets: ReleaseSecret[] = [];
+    
+    // Encontrar a seção de secrets (## 3. Keys ou Secrets)
+    const secretsSection = content.match(/##\s*3\.\s*(Keys|Secrets)[^\n]*\n([\s\S]+?)(?=\n##)/i);
+    if (!secretsSection || !secretsSection[2]) {
+      console.warn(`[ReleaseService] ⚠️ Seção de secrets não encontrada no markdown`);
+      return secrets;
+    }
+
+    // Encontrar linhas da tabela (ignorando header e separador)
+    const tableLines = secretsSection[2].split('\n').filter(line => 
+      line.trim().includes('|') && 
+      !line.includes('---') && 
+      !line.toLowerCase().includes('ambiente') &&
+      !line.toLowerCase().includes('nenhuma secret')
+    );
+
+
+    tableLines.forEach((line, index) => {
+      const cols = line.split('|').map(c => c.trim()).filter(c => c);
+      if (cols.length >= 4 && cols[0] && cols[0] !== '-') {
+        // Converte environment para enum
+        const envStr = cols[0].toUpperCase();
+        let environment: Environment = Environment.DEV;
+        if (envStr.includes('QAS') || envStr.includes('QA')) {
+          environment = Environment.QAS;
+        } else if (envStr.includes('PRD') || envStr.includes('PROD')) {
+          environment = Environment.PRD;
+        }
+        
+        // Converte status para enum
+        const statusStr = (cols[3] || '').toUpperCase();
+        let status: SecretStatus = SecretStatus.PENDING;
+        if (statusStr.includes('CONFIGURED') || statusStr.includes('CONFIGURADO') || statusStr.includes('OK')) {
+          status = SecretStatus.CONFIGURED;
+        } else if (statusStr.includes('NOT_REQUIRED') || statusStr.includes('NÃO NECESSÁRIO') || statusStr.includes('NAO NECESSARIO')) {
+          status = SecretStatus.NOT_REQUIRED;
+        }
+        
+        secrets.push({
+          id: `secret-${Date.now()}-${index}`,
+          environment: environment,
+          key: cols[1] || '',
+          description: cols[2] || '',
+          status: status
+        });
+      }
+    });
+
+    return secrets;
+  }
+
+  /**
+   * Parse da tabela de scripts usando regex (mais robusto)
+   */
+  private parseScriptsTableFromMarkdown(content: string, demandId: string): ReleaseScript[] {
+    const scripts: ReleaseScript[] = [];
+    
+    // Encontrar a seção de scripts (## 4. Scripts ou Scripts Necessários)
+    const scriptsSection = content.match(/##\s*4\.\s*Scripts[^\n]*\n([\s\S]+?)(?=\n##|\n---|$)/i);
+    if (!scriptsSection || !scriptsSection[1]) {
+      return scripts;
+    }
+
+    const sectionContent = scriptsSection[1];
+
+    // Encontrar linhas da tabela - filtra mais cuidadosamente
+    const allLines = sectionContent.split('\n');
+    const tableLines = allLines.filter(line => {
+      const trimmed = line.trim();
+      // Deve ter | mas não ser linha de separador ou header
+      if (!trimmed.includes('|')) return false;
+      if (trimmed.match(/^\|[\s\-:]+\|/)) return false; // Linha separadora ---
+      
+      const lower = trimmed.toLowerCase();
+      // Não pode ser header (mas pode ter a palavra script no nome do arquivo!)
+      if (lower.includes('script') && (lower.includes('caminho') || lower.includes('path') || lower.includes('chg'))) {
+        return false; // É header
+      }
+      
+      return true;
+    });
+
+
+    tableLines.forEach((line, index) => {
+      const cols = line.split('|').map(c => c.trim()).filter(c => c);
+      
+      
+      if (cols.length >= 2 && cols[0] && cols[0] !== 'Nenhum' && cols[0] !== '-') {
+        const scriptName = cols[0];
+        
+        // O path pode estar na segunda coluna entre backticks ou podemos construir
+        let scriptPath = cols[1] || '';
+        if (scriptPath.includes('`')) {
+          scriptPath = scriptPath.replace(/`/g, '').trim();
+        }
+        // Se não tem path explícito, constrói baseado no nome
+        if (!scriptPath || scriptPath === '-' || scriptPath === '') {
+          scriptPath = `scripts/${demandId}/${scriptName}`;
+        }
+        
+        const changeId = cols.length >= 3 ? (cols[2] === '-' ? '' : cols[2]) : '';
+        
+        scripts.push({
+          id: `script-${Date.now()}-${index}`,
+          name: scriptName,
+          path: scriptPath,
+          content: '', // Conteúdo não está no markdown, só o nome
+          changeId: changeId
+        });
+      }
+    });
+
+
+    return scripts;
+  }
+
+  /**
+   * Parse de observações usando regex (mais robusto)
+   */
+  private parseObservationsFromMarkdown(content: string): string | null {
+    // Busca a seção de observações (## 6. Observações, Observações Gerais, etc)
+    // Captura tudo até encontrar ---, ## (próxima seção) ou fim do arquivo
+    // Aceita variações: "## 6. Observações", "## 6. Observações Gerais", etc
+    const obsMatch = content.match(/##\s*6\.\s*Observa[çc][õo]es[^\n]*\n([\s\S]+?)(?=\n---|\n##|$)/i);
+    
+    if (obsMatch && obsMatch[1]) {
+      let observations = obsMatch[1].trim();
+      
+      // Remove linhas que são apenas separadores ou metadados
+      observations = observations
+        .split('\n')
+        .filter(line => {
+          const trimmed = line.trim();
+          // Remove linhas vazias no início/fim, separadores e metadados
+          return trimmed && 
+                 !trimmed.startsWith('*Documento gerado') &&
+                 !trimmed.startsWith('---') &&
+                 !trimmed.match(/^[-*_]{3,}$/); // Remove separadores de markdown
+        })
+        .join('\n')
+        .trim();
+      
+      return observations || null;
+    }
+    
+    return null;
   }
 
   /**
@@ -606,13 +840,40 @@ export class ReleaseService {
             })
           );
         }),
-        // 3. Cria/atualiza os scripts se houver
+        // 3. Cria/atualiza os scripts se houver (agrupados em um único commit se múltiplos)
         switchMap(() => {
           if (release.scripts.length === 0) return of(void 0);
 
-          const scriptOperations = release.scripts
-            .filter(script => script.content)
-            .map(script => {
+          const scriptsToUpdate = release.scripts.filter(script => script.content);
+          if (scriptsToUpdate.length === 0) return of(void 0);
+
+          // Se tem múltiplos scripts, agrupa em um único commit
+          if (scriptsToUpdate.length > 1) {
+            const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} ${scriptsToUpdate.length} scripts para release ${release.demandId}`;
+            
+            // Para agrupar, precisamos fazer commits sequenciais na mesma branch
+            // O GitHub API não suporta múltiplos arquivos em um único commit diretamente
+            // Então fazemos todos os commits sequencialmente com a mesma mensagem
+            // Isso cria commits separados, mas com mensagens idênticas (visíveis como um grupo)
+            let scriptChain$: Observable<void> = of(void 0);
+            
+            scriptsToUpdate.forEach((script) => {
+              const scriptPath = `scripts/${release.demandId}/${script.name}`;
+              scriptChain$ = scriptChain$.pipe(
+                switchMap(() => this.githubService.createOrUpdateFile(owner, repoName, scriptPath, script.content!, message, this.UPSERT_BRANCH).pipe(
+                  catchError(err => {
+                    console.warn(`Erro ao criar/atualizar script ${script.name} em ${repoName}:`, err);
+                    return of(void 0);
+                  }),
+                  map(() => void 0 as void)
+                ))
+              );
+            });
+
+            return scriptChain$;
+          } else {
+            // Apenas um script, cria commit individual
+            const script = scriptsToUpdate[0];
               const scriptPath = `scripts/${release.demandId}/${script.name}`;
               const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} script ${script.name} para release ${release.demandId}`;
 
@@ -622,9 +883,7 @@ export class ReleaseService {
                   return of(void 0);
                 })
               );
-            });
-
-          return forkJoin(scriptOperations.length > 0 ? scriptOperations : [of(void 0)]);
+          }
         })
       );
     });
@@ -672,56 +931,8 @@ export class ReleaseService {
     );
   }
 
-  /**
-   * Verifica se uma release tem commits pendentes de PR
-   * Retorna true se a release está versionada (em develop) mas o arquivo na feature/upsert-release é diferente (não mergeado)
-   */
-  hasPendingCommits(release: Release): Observable<boolean> {
-    // Se não tem repositórios associados, não tem commits pendentes
-    if (!release.repositories || release.repositories.length === 0) {
-      return of(false);
-    }
-
-    // Verifica se tem token GitHub disponível
-    if (!this.githubService.hasValidToken()) {
-      return of(false);
-    }
-
-    // Primeiro verifica se está versionada
-    return this.isReleaseVersioned(release).pipe(
-      switchMap(isVersioned => {
-        if (!isVersioned) {
-          return of(false); // Se não está versionada, não tem commits pendentes
-        }
-
-        // Se está versionada, verifica se o arquivo na feature/upsert-release é diferente do develop (não mergeado)
-        const checks = release.repositories.map(repo => {
-          const repoInfo = this.githubService.parseRepositoryUrl(repo.url);
-          if (!repoInfo) {
-            return of(false);
-          }
-
-          const releaseFilePath = `releases/release_${release.demandId}.md`;
-          
-          // Busca SHA do arquivo em ambas as branches
-          const developSha$ = this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, releaseFilePath, 'develop');
-          const upsertSha$ = this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, releaseFilePath, this.UPSERT_BRANCH);
-          
-          return forkJoin([developSha$, upsertSha$]).pipe(
-            map(([developSha, upsertSha]) => {
-              // Tem commits pendentes se o arquivo existe na upsert e é diferente do develop
-              return upsertSha !== null && developSha !== null && upsertSha !== developSha;
-            }),
-            catchError(() => of(false))
-          );
-        });
-
-        return forkJoin(checks).pipe(
-          map(results => results.some(hasPending => hasPending === true))
-        );
-      })
-    );
-  }
+  // Removido: hasPendingCommits (consumia muita memória com requisições ao GitHub)
+  // Agora usa apenas isVersioned do localStorage: se isVersioned === false, está pendente de versionar
 
   /**
    * Desfaz a última edição de uma release (undo commit)

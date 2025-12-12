@@ -359,24 +359,41 @@ import { ReleaseService, SyncService, GitHubService, NotificationService, LocalS
         
         <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
           <div *ngFor="let release of recentReleases" 
-               class="card p-5 cursor-pointer hover:border-primary-300 hover:shadow-soft transition-all duration-200 group"
-               (click)="openRelease(release)">
-            <div class="flex items-center justify-between mb-3">
-              <span class="font-mono text-xs font-semibold text-primary-600 bg-primary-50 px-2.5 py-1 rounded-lg border border-primary-100 group-hover:bg-primary-100 group-hover:border-primary-200 transition-colors">
-                {{ release.demandId }}
-              </span>
-              <span class="text-xs text-slate-400 font-medium">
-                {{ release.updatedAt | date:'dd/MM/yy' }}
-              </span>
+               class="card p-5 hover:border-primary-300 hover:shadow-soft transition-all duration-200 group">
+            <div class="flex items-start justify-between mb-3">
+              <div class="flex-1 cursor-pointer" (click)="openRelease(release)">
+                <span class="font-mono text-xs font-semibold text-primary-600 bg-primary-50 px-2.5 py-1 rounded-lg border border-primary-100 group-hover:bg-primary-100 group-hover:border-primary-200 transition-colors">
+                  {{ release.demandId }}
+                </span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button 
+                  (click)="syncDemand(release.demandId, $event)"
+                  [disabled]="syncingDemands.has(release.demandId)"
+                  class="p-1.5 text-slate-400 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Sincronizar esta demanda">
+                  <svg *ngIf="!syncingDemands.has(release.demandId)" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                  </svg>
+                  <svg *ngIf="syncingDemands.has(release.demandId)" class="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                  </svg>
+                </button>
+                <span class="text-xs text-slate-400 font-medium">
+                  {{ getFormattedDate(release.updatedAt) }}
+                </span>
+              </div>
             </div>
-            <h3 class="text-sm font-semibold text-slate-900 mb-2.5 line-clamp-2 min-h-[2.5rem] group-hover:text-primary-600 transition-colors">
-              {{ getReleaseTitle(release) }}
-            </h3>
-            <div class="flex items-center gap-2 text-xs text-slate-500 pt-2 border-t border-slate-100">
-              <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/>
-              </svg>
-              <span class="truncate">{{ release.updatedBy || release.createdBy || 'Não informado' }}</span>
+            <div class="cursor-pointer" (click)="openRelease(release)">
+              <h3 class="text-sm font-semibold text-slate-900 mb-2.5 line-clamp-2 min-h-[2.5rem] group-hover:text-primary-600 transition-colors">
+                {{ getReleaseTitle(release) }}
+              </h3>
+              <div class="flex items-center gap-2 text-xs text-slate-500 pt-2 border-t border-slate-100">
+                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/>
+                </svg>
+                <span class="truncate">{{ release.updatedBy || release.createdBy || 'Não informado' }}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -410,6 +427,7 @@ export class HomeComponent implements OnInit, OnDestroy {
   recentReleases: Release[] = [];
   isSyncing = false;
   canSync = false;
+  syncingDemands = new Set<string>();
 
   private destroy$ = new Subject<void>();
 
@@ -477,10 +495,58 @@ export class HomeComponent implements OnInit, OnDestroy {
 
   getReleaseTitle(release: Release): string {
     const title = release.title || release.description || '';
+    if (!title || title.length === 0) {
+      return 'Sem título';
+    }
     if (title.length > 80) {
       return title.slice(0, 80) + '...';
     }
     return title;
+  }
+
+  getFormattedDate(date: Date | string | undefined): string {
+    if (!date) {
+      return 'N/A';
+    }
+    try {
+      const dateObj = date instanceof Date ? date : new Date(date);
+      if (isNaN(dateObj.getTime())) {
+        return 'N/A';
+      }
+      return dateObj.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit' });
+    } catch {
+      return 'N/A';
+    }
+  }
+
+  syncDemand(demandId: string, event?: Event): void {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    if (!this.canSync) {
+      this.notificationService.warning('Faça login com GitHub ou configure um token de serviço para sincronizar');
+      return;
+    }
+
+    if (this.syncingDemands.has(demandId)) {
+      return;
+    }
+
+    this.syncingDemands.add(demandId);
+    
+    this.syncService.syncDemand(demandId).subscribe({
+      next: (result: { synced: number; errors: string[] }) => {
+        this.syncingDemands.delete(demandId);
+        // Recarrega a lista de releases
+        this.loadReleases();
+      },
+      error: (error: any) => {
+        this.syncingDemands.delete(demandId);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.notificationService.error(`Erro ao sincronizar ${demandId}: ${errorMessage}`);
+      }
+    });
   }
 
   syncWithGitHub(): void {

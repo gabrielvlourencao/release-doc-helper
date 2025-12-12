@@ -11,11 +11,10 @@ import { GitHubAuthService } from './github-auth.service';
 /**
  * Serviço para sincronizar releases entre GitHub e localStorage
  * 
- * Fluxo:
- * 1. Busca releases de todos os repositórios no GitHub
- * 2. Faz parse dos arquivos .md
- * 3. Atualiza o localStorage com as releases encontradas
- * 4. Releases versionadas são sincronizadas do GitHub
+ * REGRAS:
+ * - Releases NÃO versionadas: SEMPRE buscam na branch feature/upsert-release
+ * - Releases versionadas: buscam na branch develop (só se já existem versionadas em tela - otimização)
+ * - feature/upsert-release SEMPRE atualiza o documento (não compara, força atualização)
  */
 @Injectable({
   providedIn: 'root'
@@ -31,8 +30,9 @@ export class SyncService {
 
   /**
    * Sincroniza releases do GitHub para o localStorage
-   * Busca todos os arquivos de release nos repositórios e atualiza o localStorage
-   * Remove do localStorage as releases versionadas que não foram encontradas no GitHub
+   * 
+   * IMPORTANTE: Este método APENAS LÊ do GitHub e salva no localStorage.
+   * NUNCA cria commits no GitHub. Apenas sincroniza (read-only).
    */
   syncFromGitHub(): Observable<{ synced: number; removed: number; errors: string[] }> {
     if (!this.githubService.hasValidToken()) {
@@ -41,355 +41,243 @@ export class SyncService {
 
     this.notificationService.info('Iniciando sincronização com GitHub...');
 
-    return this.githubService.listAllReleasesFromRepos().pipe(
-      switchMap(reposWithReleases => {
-        // Se não encontrou nenhuma release, não remove nada do Firestore
-        // Pode ser que o usuário não tenha acesso aos repositórios
-        if (reposWithReleases.length === 0) {
-          this.notificationService.info('Nenhuma release encontrada nos repositórios acessíveis. Verifique se você tem acesso aos repositórios das organizações.');
-          return of({ synced: 0, removed: 0, errors: [] });
-        }
+    // Primeiro pega releases existentes para saber quais são versionadas
+    return this.localStorageReleaseService.getAll().pipe(
+      take(1),
+      switchMap(existingReleases => {
+        // Coleta demandIds das releases versionadas (para otimizar busca na develop)
+        const versionedDemandIds = new Set(
+          existingReleases
+            .filter(r => r.isVersioned === true)
+            .map(r => r.demandId.toUpperCase())
+        );
 
-        // Coleta todos os arquivos de release (com informação da branch)
-        const allReleaseFiles: Array<{ repo: string; name: string; path: string; sha: string; branch: string }> = [];
-        reposWithReleases.forEach(repoData => {
-          repoData.releases.forEach(release => {
-            allReleaseFiles.push({
-              repo: repoData.repo,
-              name: release.name,
-              path: release.path,
-              sha: release.sha,
-              branch: release.branch || 'develop' // Default para develop se não tiver branch
+        return this.githubService.listAllReleasesFromRepos().pipe(
+          switchMap(reposWithReleases => {
+            if (reposWithReleases.length === 0) {
+              this.notificationService.info('Nenhuma release encontrada nos repositórios acessíveis.');
+              return of({ synced: 0, removed: 0, errors: [] });
+            }
+
+            // REGRA CRÍTICA: 
+            // 1. Se existe em feature/upsert-release, SEMPRE prioriza ela (releases não versionadas)
+            // 2. Se não existe em feature/upsert-release mas existe em develop, usa develop (releases versionadas)
+            // 3. Não busca na develop se já existe em feature/upsert-release (evita 403 e duplicatas)
+            
+            const releaseMap = new Map<string, { repo: string; name: string; path: string; sha: string; branch: string }>();
+            
+            // Primeiro, coleta TODAS as releases de feature/upsert-release (prioridade máxima)
+            reposWithReleases.forEach(repoData => {
+              repoData.releases.forEach(release => {
+                if (release.branch === 'feature/upsert-release') {
+                  const key = `${repoData.repo}:${release.name}`;
+                  // SEMPRE adiciona feature/upsert-release
+                  releaseMap.set(key, {
+                    repo: repoData.repo,
+                    name: release.name,
+                    path: release.path,
+                    sha: release.sha,
+                    branch: 'feature/upsert-release'
+                  });
+                }
+              });
             });
-          });
-        });
-
-        // Processa cada arquivo
-        // Nota: getUserRepositories() já filtra apenas repositórios de organizações,
-        // então todos os arquivos aqui são de orgs, não pessoais
-        const operations = allReleaseFiles.map(file => {
-          const repoInfo = this.githubService.parseRepositoryUrl(`https://github.com/${file.repo}`);
-          if (!repoInfo) {
-            return of({ success: false, error: `URL inválida: ${file.repo}` });
-          }
-
-          // Busca o conteúdo do arquivo na branch correta
-          const branch = file.branch || 'develop';
-          return this.githubService.getReleaseFileContent(repoInfo.owner, repoInfo.repo, file.path, branch).pipe(
-            switchMap(content => {
-              if (!content) {
-                return of({ success: false, error: `Conteúdo vazio: ${file.path}` });
-              }
-
-              // Faz parse do markdown
-              const releaseData = this.releaseService.parseMarkdownToRelease(
-                content,
-                file.name,
-                file.repo
-              );
-
-              if (!releaseData.demandId) {
-                return of({ success: false, error: `Não foi possível extrair demandId de ${file.name}` });
-              }
-
-              // Gera ID baseado apenas no demandId (mesma release pode estar em múltiplos repositórios)
-              const releaseId = `REL-${releaseData.demandId.toUpperCase()}`;
-              const repoFullName = `${repoInfo.owner}/${repoInfo.repo}`;
-              const repoUrl = `https://github.com/${repoFullName}`;
-              
-              // Busca informações dos commits para obter createdBy e updatedBy
-              const lastCommit$ = this.githubService.getFileLastCommit(repoInfo.owner, repoInfo.repo, file.path, branch);
-              const firstCommit$ = this.githubService.getFileFirstCommit(repoInfo.owner, repoInfo.repo, file.path, branch);
-              
-              return forkJoin([lastCommit$, firstCommit$]).pipe(
-                switchMap(([lastCommit, firstCommit]) => {
-                  // Verifica se já existe no localStorage por demandId
-                  const demandId = releaseData.demandId || '';
-                  return this.localStorageReleaseService.getByDemandId(demandId).pipe(
-                    take(1),
-                    switchMap(existingRelease => {
-                      // Determina se está versionada baseado na branch
-                      // Releases na branch develop são versionadas, na feature/upsert-release não são
-                      const isVersioned = branch === 'develop';
-                      
-                      // Usa o autor do primeiro commit como createdBy, ou mantém o existente se já houver
-                      const createdBy = existingRelease?.createdBy || firstCommit?.author || this.getCurrentUserLogin();
-                      // Usa o autor do último commit como updatedBy
-                      const updatedBy = lastCommit?.author || this.getCurrentUserLogin();
-                      
-                      // Usa a data do primeiro commit como createdAt, ou mantém o existente
-                      const createdAt = existingRelease?.createdAt || firstCommit?.date || new Date();
-                      // Usa a data do último commit como updatedAt
-                      const updatedAt = lastCommit?.date || new Date();
-                      
-                      // Mescla repositórios: adiciona o repositório atual se não estiver na lista
-                      const existingRepos = existingRelease?.repositories || [];
-                      const newRepos = releaseData.repositories || [];
-                      const mergedRepos = [...existingRepos];
-                      
-                      // Verifica se o repositório atual já está na lista
-                      const repoExists = mergedRepos.some(r => 
-                        r.url === repoUrl || 
-                        r.url.includes(repoFullName) ||
-                        r.name === repoFullName
-                      );
-                      
-                      if (!repoExists) {
-                        // Adiciona o repositório atual à lista
-                        mergedRepos.push({
-                          id: `repo-${Date.now()}`,
-                          url: repoUrl,
-                          name: repoFullName,
-                          impact: 'Release sincronizada do GitHub',
-                          releaseBranch: branch
-                        });
-                      }
-                      
-                      // Adiciona outros repositórios novos que não estão na lista
-                      newRepos.forEach(newRepo => {
-                        const exists = mergedRepos.some(existingRepo => 
-                          existingRepo.url === newRepo.url || 
-                          existingRepo.name === newRepo.name
-                        );
-                        if (!exists) {
-                          mergedRepos.push(newRepo);
-                        }
-                      });
-                      
-                      // Usa o ID existente se houver, senão usa o novo
-                      const finalId = existingRelease?.id || releaseId;
-                      
-                      // Cria objeto Release completo (mesma release, múltiplos repositórios)
-                      const release: Release = {
-                        id: finalId,
-                        demandId: releaseData.demandId || '',
-                        title: releaseData.title || existingRelease?.title || '',
-                        description: releaseData.description || existingRelease?.description || '',
-                        responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
-                        secrets: releaseData.secrets || existingRelease?.secrets || [],
-                        scripts: releaseData.scripts || existingRelease?.scripts || [],
-                        repositories: mergedRepos,
-                        observations: releaseData.observations || existingRelease?.observations || '',
-                        createdAt: createdAt,
-                        updatedAt: updatedAt,
-                        createdBy: createdBy,
-                        updatedBy: updatedBy,
-                        isVersioned: isVersioned || existingRelease?.isVersioned || false
-                      };
-
-                      // Sincroniza no localStorage
-                      return this.localStorageReleaseService.syncRelease(release).pipe(
-                        map(() => ({ success: true, release })),
-                        catchError(error => {
-                          console.error(`Erro ao sincronizar ${file.name}:`, error);
-                          const errorMessage = error instanceof Error ? error.message : String(error);
-                          return of({ success: false, error: `Erro ao sincronizar ${file.name}: ${errorMessage}` });
-                        })
-                      );
-                    })
-                  );
-                }),
-                catchError(error => {
-                  // Se falhar ao buscar commits, usa fallback com usuário atual
-                  console.warn(`Erro ao buscar commits de ${file.path}, usando fallback:`, error);
-                  const currentUser = this.getCurrentUserLogin();
-                  const demandId = releaseData.demandId || '';
+            
+            // Depois, adiciona releases da develop APENAS se NÃO existe em feature/upsert-release
+            // Isso evita buscar arquivos que não existem (403) e garante que feature/upsert-release sempre prevalece
+            reposWithReleases.forEach(repoData => {
+              repoData.releases.forEach(release => {
+                if (release.branch === 'develop') {
+                  const key = `${repoData.repo}:${release.name}`;
                   
+                  // Só adiciona develop se NÃO existe feature/upsert-release para esta release
+                  if (!releaseMap.has(key)) {
+                    releaseMap.set(key, {
+                      repo: repoData.repo,
+                      name: release.name,
+                      path: release.path,
+                      sha: release.sha,
+                      branch: 'develop'
+                    });
+                  }
+                }
+              });
+            });
+
+            const uniqueReleaseFiles = Array.from(releaseMap.values());
+            
+            // Processa primeiro develop, depois feature/upsert-release (para que upsert sobrescreva develop se ambas existirem)
+            uniqueReleaseFiles.sort((a, b) => {
+              if (a.branch === 'feature/upsert-release' && b.branch === 'develop') return 1;
+              if (a.branch === 'develop' && b.branch === 'feature/upsert-release') return -1;
+              return 0;
+            });
+            
+
+            // Processa cada arquivo
+            const operations = uniqueReleaseFiles.map(file => {
+              const repoInfo = this.githubService.parseRepositoryUrl(`https://github.com/${file.repo}`);
+              if (!repoInfo) {
+                return of({ success: false, error: `URL inválida: ${file.repo}` });
+              }
+
+              const branch = file.branch || 'develop';
+              
+              // Busca SEMPRE do HEAD da branch (conteúdo mais recente do commit mais recente)
+              return this.githubService.getReleaseFileContent(repoInfo.owner, repoInfo.repo, file.path, branch).pipe(
+                switchMap(content => {
+                  if (!content) {
+                    console.warn(`[SyncService] ⚠️ Conteúdo vazio para ${file.path} na branch ${branch}`);
+                    return of({ success: false, error: `Conteúdo vazio: ${file.path}` });
+                  }
+
+                  // Faz parse do markdown (converte markdown para objeto Release)
+                  const releaseData = this.releaseService.parseMarkdownToRelease(
+                    content,
+                    file.name,
+                    file.repo
+                  );
+
+                  if (!releaseData.demandId) {
+                    return of({ success: false, error: `Não foi possível extrair demandId de ${file.name}` });
+                  }
+
+                  // Busca o conteúdo dos scripts do GitHub APENAS se houver scripts referenciados no .md
+                  // IMPORTANTE: Só busca scripts que foram parseados da tabela de scripts do markdown
+                  const demandId = releaseData.demandId || '';
+                  if (releaseData.scripts && releaseData.scripts.length > 0) {
+                    // Filtra apenas scripts com nome válido (garantindo que vieram do parse do markdown)
+                    const validScripts = releaseData.scripts.filter(script => script.name && script.name.trim() !== '');
+                    if (validScripts.length > 0) {
+                      const scriptOperations = validScripts.map(script => {
+                        // Busca da pasta scripts/${demandId}/ apenas para scripts que estão no markdown
+                        // O script.name vem do parse da tabela de scripts do .md
+                        const scriptPath = `scripts/${demandId}/${script.name}`;
+                        return this.githubService.getFileContent(repoInfo.owner, repoInfo.repo, scriptPath, branch).pipe(
+                        map((scriptContent: string | null) => {
+                          if (scriptContent) {
+                            script.content = scriptContent;
+                          }
+                          return script;
+                        }),
+                        catchError((err: any) => {
+                          // 404 = arquivo não existe, isso é OK (pode ser novo)
+                          if (err.status !== 404) {
+                            console.warn(`[SyncService] ⚠️ Erro ao buscar script ${script.name}:`, err.message);
+                          }
+                          return of(script);
+                        })
+                      );
+                      });
+                      
+                      return forkJoin(scriptOperations).pipe(
+                        switchMap((scriptsWithContent) => {
+                          // Atualiza apenas os scripts que foram buscados, mantendo os outros
+                          if (releaseData.scripts) {
+                            releaseData.scripts = releaseData.scripts.map(script => {
+                              const found = scriptsWithContent.find(s => s.name === script.name);
+                              return found || script;
+                            });
+                          } else {
+                            releaseData.scripts = scriptsWithContent;
+                          }
+                          // Continua com o processamento normal da release - busca existingRelease primeiro
+                          return this.localStorageReleaseService.getByDemandId(demandId).pipe(
+                            take(1),
+                            switchMap(existingRelease => {
+                              return this.processReleaseAfterParse(releaseData, file, repoInfo, branch, demandId, existingRelease);
+                            })
+                          );
+                        })
+                      );
+                    }
+                  }
+
+                  // Se não há scripts, continua normalmente - busca existingRelease primeiro
                   return this.localStorageReleaseService.getByDemandId(demandId).pipe(
                     take(1),
                     switchMap(existingRelease => {
-                      const isVersioned = branch === 'develop';
-                      
-                      // Mescla repositórios: adiciona o repositório atual se não estiver na lista
-                      const existingRepos = existingRelease?.repositories || [];
-                      const newRepos = releaseData.repositories || [];
-                      const mergedRepos = [...existingRepos];
-                      
-                      // Verifica se o repositório atual já está na lista
-                      const repoExists = mergedRepos.some(r => 
-                        r.url === repoUrl || 
-                        r.url.includes(repoFullName) ||
-                        r.name === repoFullName
-                      );
-                      
-                      if (!repoExists) {
-                        // Adiciona o repositório atual à lista
-                        mergedRepos.push({
-                          id: `repo-${Date.now()}`,
-                          url: repoUrl,
-                          name: repoFullName,
-                          impact: 'Release sincronizada do GitHub',
-                          releaseBranch: branch
-                        });
-                      }
-                      
-                      // Adiciona outros repositórios novos que não estão na lista
-                      newRepos.forEach(newRepo => {
-                        const exists = mergedRepos.some(existingRepo => 
-                          existingRepo.url === newRepo.url || 
-                          existingRepo.name === newRepo.name
-                        );
-                        if (!exists) {
-                          mergedRepos.push(newRepo);
-                        }
-                      });
-                      
-                      const finalId = existingRelease?.id || releaseId;
-                      
-                      const release: Release = {
-                        id: finalId,
-                        demandId: releaseData.demandId || '',
-                        title: releaseData.title || existingRelease?.title || '',
-                        description: releaseData.description || existingRelease?.description || '',
-                        responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
-                        secrets: releaseData.secrets || existingRelease?.secrets || [],
-                        scripts: releaseData.scripts || existingRelease?.scripts || [],
-                        repositories: mergedRepos,
-                        observations: releaseData.observations || existingRelease?.observations || '',
-                        createdAt: existingRelease?.createdAt || new Date(),
-                        updatedAt: new Date(),
-                        createdBy: existingRelease?.createdBy || currentUser,
-                        updatedBy: currentUser,
-                        isVersioned: isVersioned || existingRelease?.isVersioned || false
-                      };
-
-                      return this.localStorageReleaseService.syncRelease(release).pipe(
-                        map(() => ({ success: true, release })),
-                        catchError(syncError => {
-                          console.error(`Erro ao sincronizar ${file.name}:`, syncError);
-                          const errorMessage = syncError instanceof Error ? syncError.message : String(syncError);
-                          return of({ success: false, error: `Erro ao sincronizar ${file.name}: ${errorMessage}` });
-                        })
-                      );
+                      return this.processReleaseAfterParse(releaseData, file, repoInfo, branch, demandId, existingRelease);
                     })
                   );
                 })
               );
-            }),
-            catchError(error => {
-              console.error(`Erro ao buscar conteúdo de ${file.path}:`, error);
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              return of({ success: false, error: `Erro ao buscar ${file.path}: ${errorMessage}` });
-            })
-          );
-        });
-
-        return forkJoin(operations).pipe(
-          switchMap(results => {
-            const synced = results.filter(r => r.success).length;
-            const errors = results
-              .filter((r): r is { success: false; error: string } => !r.success && 'error' in r)
-              .map(r => r.error);
-
-            // Coleta os demandIds das releases que foram sincronizadas com sucesso
-            const syncedDemandIds = new Set<string>();
-            results.forEach(r => {
-              if (r.success && 'release' in r && r.release) {
-                syncedDemandIds.add(r.release.demandId.toUpperCase());
-              }
             });
 
+            return forkJoin(operations).pipe(
+              switchMap(results => {
+                type ResultType = { success: boolean; release?: Release; error?: string; skipped?: boolean };
+                const typedResults = results as ResultType[];
+                
+                const synced = typedResults.filter(r => r.success && !('skipped' in r && r.skipped)).length;
+                const skipped = typedResults.filter(r => r.success && 'skipped' in r && r.skipped).length;
+                const errors = typedResults
+                  .filter((r): r is { success: false; error: string } => !r.success && 'error' in r)
+                  .map(r => r.error);
 
-            // Só remove do localStorage se não houver erros críticos
-            // Erros críticos = mais de 50% das operações falharam
-            const hasCriticalErrors = errors.length > operations.length * 0.5;
-
-            if (hasCriticalErrors) {
-              console.warn('[SyncService] Muitos erros detectados, não removendo releases do localStorage');
-              return of({ synced, removed: 0, errors });
-            }
-
-            // Busca releases do localStorage para comparar (pega valor atual)
-            return this.localStorageReleaseService.getAll().pipe(
-              take(1), // Pega apenas o valor atual
-              switchMap(localReleases => {
-                // Para cada release no localStorage que não foi encontrada na sincronização,
-                // verifica diretamente no GitHub se o arquivo ainda existe
-                // Isso evita remover releases de repositórios que o usuário não tem acesso
-                // IMPORTANTE: Releases não versionadas (isVersioned === false) NUNCA são removidas
-                const releasesToCheck = localReleases.filter(localRelease => {
-                  const demandId = localRelease.demandId.toUpperCase();
-                  const notFoundInSync = !syncedDemandIds.has(demandId);
-                  const isVersioned = localRelease.isVersioned ?? false;
-                  
-                  // Só verifica se deve remover se:
-                  // 1. Não foi encontrada na sincronização E
-                  // 2. Está marcada como versionada (releases não versionadas são sempre preservadas)
-                  return notFoundInSync && isVersioned;
-                });
-
-
-                if (releasesToCheck.length === 0) {
-                  return of({ synced, removed: 0, errors });
-                }
-
-                // Para cada release, verifica se o arquivo existe nos repositórios onde deveria estar
-                const checkOperations = releasesToCheck.map(release => {
-                  // Se a release tem repositórios definidos, verifica neles
-                  if (release.repositories && release.repositories.length > 0) {
-                    const checkOps = release.repositories.map(repo => {
-                      const repoInfo = this.githubService.parseRepositoryUrl(repo.url);
-                      if (!repoInfo) {
-                        return of({ exists: false, repo: repo.url, reason: 'invalid_url' });
-                      }
-
-                      const releaseFilePath = `releases/release_${release.demandId}.md`;
-                      return this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, releaseFilePath, 'develop').pipe(
-                        map((sha: string | null) => ({ 
-                          exists: sha !== null, 
-                          repo: repoInfo.repo, 
-                          reason: sha !== null ? 'found' : 'not_found' 
-                        })),
-                        catchError(error => {
-                          // 404 = arquivo não existe, outros erros podem ser permissão
-                          if (error.status === 404) {
-                            return of({ exists: false, repo: repoInfo.repo, reason: 'not_found' });
-                          }
-                          // Se for erro de permissão ou outro, assume que pode existir (não remove)
-                          console.warn(`[SyncService] Erro ao verificar ${release.demandId} em ${repoInfo.repo}:`, error.status);
-                          return of({ exists: true, repo: repoInfo.repo, reason: 'error_checking' });
-                        })
-                      );
-                    });
-
-                    return forkJoin(checkOps).pipe(
-                      map(results => {
-                        // Só remove se NENHUM repositório tem o arquivo (todos retornaram not_found)
-                        const allNotFound = results.every(r => r.exists === false && r.reason === 'not_found');
-                        return { release, shouldRemove: allNotFound, checks: results };
-                      })
-                    );
-                  } else {
-                    // Release sem repositórios definidos, não remove (pode ser antiga ou local)
-                    return of({ release, shouldRemove: false, checks: [] });
+                const syncedDemandIds = new Set<string>();
+                typedResults.forEach(r => {
+                  if (r.success && 'release' in r && r.release) {
+                    syncedDemandIds.add(r.release.demandId.toUpperCase());
                   }
                 });
 
-                return forkJoin(checkOperations).pipe(
-                  switchMap(checkResults => {
-                    const releasesToRemove = checkResults
-                      .filter(result => result.shouldRemove)
-                      .map(result => result.release);
+                const hasCriticalErrors = errors.length > operations.length * 0.5;
 
+                if (hasCriticalErrors) {
+                  console.warn('[SyncService] Muitos erros detectados, não removendo releases do localStorage');
+                  return of({ synced, removed: 0, errors });
+                }
 
-                    if (releasesToRemove.length === 0) {
+                return this.localStorageReleaseService.getAll().pipe(
+                  take(1),
+                  switchMap(localReleases => {
+                    const releasesToCheck = localReleases.filter(localRelease => {
+                      const demandId = localRelease.demandId.toUpperCase();
+                      const notFoundInSync = !syncedDemandIds.has(demandId);
+                      const isVersioned = localRelease.isVersioned ?? false;
+                      return notFoundInSync && isVersioned;
+                    });
+
+                    if (releasesToCheck.length === 0) {
                       return of({ synced, removed: 0, errors });
                     }
 
-                    // Remove apenas as releases confirmadas como inexistentes
-                    const deleteOperations = releasesToRemove.map(release => 
-                      this.localStorageReleaseService.deleteRelease(release.id).pipe(
-                        map(() => ({ success: true, releaseId: release.id })),
-                        catchError(error => {
-                          console.error(`[SyncService] Erro ao remover release ${release.id} do localStorage:`, error);
-                          return of({ success: false, releaseId: release.id });
-                        })
-                      )
-                    );
+                    const checkOperations = releasesToCheck.map(release => {
+                      if (release.repositories && release.repositories.length > 0) {
+                        const checkOps = release.repositories.map(repo => {
+                          const repoInfo = this.githubService.parseRepositoryUrl(repo.url);
+                          if (!repoInfo) {
+                            return of(false);
+                          }
 
-                    return forkJoin(deleteOperations).pipe(
-                      map(deleteResults => {
-                        const removed = deleteResults.filter(r => r.success).length;
+                          const filePath = `releases/release_${release.demandId}.md`;
+                          return forkJoin([
+                            this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, filePath, 'feature/upsert-release'),
+                            this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, filePath, 'develop')
+                          ]).pipe(
+                            map(([sha1, sha2]) => sha1 !== null || sha2 !== null),
+                            catchError(() => of(false))
+                          );
+                        });
+
+                        return forkJoin(checkOps).pipe(
+                          map(results => results.some(exists => exists))
+                        );
+                      }
+                      return of(false);
+                    });
+
+                    return forkJoin(checkOperations).pipe(
+                      map(checkResults => {
+                        const releasesToRemove = releasesToCheck.filter((_, index) => !checkResults[index]);
+                        const removed = releasesToRemove.length;
+
+                        if (removed > 0) {
+                          releasesToRemove.forEach(release => {
+                            this.localStorageReleaseService.deleteRelease(release.id).subscribe();
+                          });
+                        }
 
                         if (synced > 0) {
                           this.notificationService.success(
@@ -415,25 +303,250 @@ export class SyncService {
             );
           })
         );
-      }),
-      catchError(error => {
-        console.error('[SyncService] Erro na sincronização:', error);
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        this.notificationService.error(`Erro ao sincronizar: ${errorMessage}`);
-        return throwError(() => error);
       })
     );
   }
+
+  // Método auxiliar para processar release após parse e carregamento de scripts
+  private processReleaseAfterParse(
+    releaseData: Partial<Release>,
+    file: { name: string; path: string; repo: string; branch: string },
+    repoInfo: { owner: string; repo: string },
+    branch: string,
+    demandId: string,
+    existingRelease: Release | null
+  ): Observable<{ success: boolean; release?: Release; error?: string; skipped?: boolean }> {
+    const releaseId = `REL-${demandId.toUpperCase()}`;
+    const repoFullName = `${repoInfo.owner}/${repoInfo.repo}`;
+    const repoUrl = `https://github.com/${repoFullName}`;
+    
+    const isUpsertBranch = branch === 'feature/upsert-release';
+    
+    // REGRA CRÍTICA: feature/upsert-release SEMPRE atualiza (não compara, força atualização)
+    // develop só atualiza se conteúdo mudou (otimização)
+    if (!isUpsertBranch && existingRelease) {
+            // Para develop, verifica se mudou
+            const hasContentChanged = 
+              JSON.stringify(existingRelease.title) !== JSON.stringify(releaseData.title) ||
+              JSON.stringify(existingRelease.description) !== JSON.stringify(releaseData.description) ||
+              JSON.stringify(existingRelease.responsible) !== JSON.stringify(releaseData.responsible) ||
+              JSON.stringify(existingRelease.secrets) !== JSON.stringify(releaseData.secrets) ||
+              JSON.stringify(existingRelease.scripts) !== JSON.stringify(releaseData.scripts) ||
+              JSON.stringify(existingRelease.observations) !== JSON.stringify(releaseData.observations);
+            
+            if (!hasContentChanged) {
+              // Conteúdo não mudou na develop, pula
+              return of({
+                success: true,
+                release: existingRelease,
+                skipped: true
+              });
+            }
+          }
+          
+          // Busca commits apenas se necessário
+          const lastCommit$ = this.githubService.getFileLastCommit(repoInfo.owner, repoInfo.repo, file.path, branch);
+          const firstCommit$ = existingRelease 
+            ? of(null)
+            : this.githubService.getFileFirstCommit(repoInfo.owner, repoInfo.repo, file.path, branch);
+                      
+          return forkJoin([lastCommit$, firstCommit$]).pipe(
+            switchMap(([lastCommit, firstCommit]) => {
+              const isVersioned = branch === 'develop';
+              
+              const createdBy = existingRelease?.createdBy || firstCommit?.author || this.getCurrentUserLogin();
+              const updatedBy = lastCommit?.author || existingRelease?.updatedBy || this.getCurrentUserLogin();
+              const createdAt = existingRelease?.createdAt || firstCommit?.date || new Date();
+              const updatedAt = (isUpsertBranch || !existingRelease) && lastCommit?.date 
+                ? lastCommit.date 
+                : (existingRelease?.updatedAt || new Date());
+              
+              // Mescla repositórios
+              const existingRepos = existingRelease?.repositories || [];
+              const newRepos = releaseData.repositories || [];
+              const mergedRepos = [...existingRepos];
+              
+              const existingRepoIndex = mergedRepos.findIndex(r => 
+                r.url === repoUrl || 
+                r.url.includes(repoFullName) ||
+                r.name === repoFullName
+              );
+              
+              if (existingRepoIndex === -1) {
+                mergedRepos.push({
+                  id: `repo-${Date.now()}`,
+                  url: repoUrl,
+                  name: repoFullName,
+                  impact: 'Release sincronizada do GitHub',
+                  releaseBranch: branch
+                });
+              } else {
+                if (branch === 'feature/upsert-release') {
+                  mergedRepos[existingRepoIndex].releaseBranch = branch;
+                } else if (!mergedRepos[existingRepoIndex].releaseBranch) {
+                  mergedRepos[existingRepoIndex].releaseBranch = branch;
+                }
+              }
+              
+              newRepos.forEach(newRepo => {
+                const exists = mergedRepos.some(existingRepo => 
+                  existingRepo.url === newRepo.url || 
+                  existingRepo.name === newRepo.name
+                );
+                if (!exists) {
+                  mergedRepos.push(newRepo);
+                }
+              });
+              
+              const finalId = existingRelease?.id || releaseId;
+              
+              // REGRA CRÍTICA: feature/upsert-release USA 100% dos dados do releaseData (conteúdo mais recente)
+              // develop: mescla (preserva dados que não estão no markdown)
+              const release: Release = isUpsertBranch ? {
+                // feature/upsert-release: USA TUDO do releaseData parseado do markdown mais recente
+                // FORÇA atualização completa, substituindo qualquer conteúdo antigo no localStorage
+                id: finalId,
+                demandId: releaseData.demandId || '',
+                title: releaseData.title || '',
+                description: releaseData.description || '',
+                responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
+                secrets: releaseData.secrets || [],
+                scripts: releaseData.scripts || [],
+                repositories: mergedRepos,
+                observations: releaseData.observations || '',
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                createdBy: createdBy,
+                updatedBy: updatedBy,
+                isVersioned: false
+              } : {
+                // develop: mescla (preserva dados que não estão no markdown)
+                id: finalId,
+                demandId: releaseData.demandId || '',
+                title: releaseData.title || existingRelease?.title || '',
+                description: releaseData.description || existingRelease?.description || '',
+                responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
+                secrets: releaseData.secrets || existingRelease?.secrets || [],
+                scripts: releaseData.scripts || existingRelease?.scripts || [],
+                repositories: mergedRepos,
+                observations: releaseData.observations || existingRelease?.observations || '',
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                createdBy: createdBy,
+                updatedBy: updatedBy,
+                isVersioned: true
+              };
+              
+
+              // IMPORTANTE: syncRelease apenas salva no localStorage, NÃO cria commits
+              // Usamos localStorageReleaseService diretamente, NÃO releaseService.update/create
+              return this.localStorageReleaseService.syncRelease(release).pipe(
+                map(() => {
+                  return { success: true, release };
+                }),
+                catchError(error => {
+                  console.error(`Erro ao sincronizar ${file.name}:`, error);
+                  const errorMessage = error instanceof Error ? error.message : String(error);
+                  return of({ success: false, error: `Erro ao sincronizar ${file.name}: ${errorMessage}` });
+                })
+              );
+            }),
+            catchError(error => {
+              // Se erro ao buscar commits, ainda tenta salvar com dados disponíveis
+              console.warn(`[SyncService] Erro ao buscar commits para ${file.path}:`, error);
+              const currentUser = this.getCurrentUserLogin();
+              const isUpsertBranch = branch === 'feature/upsert-release';
+              
+              const existingRepos = existingRelease?.repositories || [];
+              const newRepos = releaseData.repositories || [];
+              const mergedRepos = [...existingRepos];
+              
+              const existingRepoIndex = mergedRepos.findIndex(r => 
+                r.url === repoUrl || 
+                r.url.includes(repoFullName) ||
+                r.name === repoFullName
+              );
+              
+              if (existingRepoIndex === -1) {
+                mergedRepos.push({
+                  id: `repo-${Date.now()}`,
+                  url: repoUrl,
+                  name: repoFullName,
+                  impact: 'Release sincronizada do GitHub',
+                  releaseBranch: branch
+                });
+              } else {
+                if (branch === 'feature/upsert-release') {
+                  mergedRepos[existingRepoIndex].releaseBranch = branch;
+                } else if (!mergedRepos[existingRepoIndex].releaseBranch) {
+                  mergedRepos[existingRepoIndex].releaseBranch = branch;
+                }
+              }
+              
+              newRepos.forEach(newRepo => {
+                const exists = mergedRepos.some(existingRepo => 
+                  existingRepo.url === newRepo.url || 
+                  existingRepo.name === newRepo.name
+                );
+                if (!exists) {
+                  mergedRepos.push(newRepo);
+                }
+              });
+              
+              const finalId = existingRelease?.id || releaseId;
+              
+              const release: Release = isUpsertBranch ? {
+                id: finalId,
+                demandId: releaseData.demandId || '',
+                title: releaseData.title || '',
+                description: releaseData.description || '',
+                responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
+                secrets: releaseData.secrets || [],
+                scripts: releaseData.scripts || [],
+                repositories: mergedRepos,
+                observations: releaseData.observations || '',
+                createdAt: existingRelease?.createdAt || new Date(),
+                updatedAt: new Date(),
+                createdBy: existingRelease?.createdBy || currentUser,
+                updatedBy: currentUser,
+                isVersioned: false
+              } : {
+                id: finalId,
+                demandId: releaseData.demandId || '',
+                title: releaseData.title || existingRelease?.title || '',
+                description: releaseData.description || existingRelease?.description || '',
+                responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
+                secrets: releaseData.secrets || existingRelease?.secrets || [],
+                scripts: releaseData.scripts || existingRelease?.scripts || [],
+                repositories: mergedRepos,
+                observations: releaseData.observations || existingRelease?.observations || '',
+                createdAt: existingRelease?.createdAt || new Date(),
+                updatedAt: existingRelease?.updatedAt || new Date(),
+                createdBy: existingRelease?.createdBy || currentUser,
+                updatedBy: existingRelease?.updatedBy || currentUser,
+                isVersioned: true
+              };
+
+              return this.localStorageReleaseService.syncRelease(release).pipe(
+                map(() => ({ success: true, release })),
+                catchError(syncError => {
+                  console.error(`Erro ao sincronizar ${file.name}:`, syncError);
+                  const errorMessage = syncError instanceof Error ? syncError.message : String(syncError);
+                  return of({ success: false, error: `Erro ao sincronizar ${file.name}: ${errorMessage}` });
+                })
+              );
+            })
+          );
+        }
 
   /**
    * Obtém o login do usuário atual (GitHub ou funcional)
    */
   private getCurrentUserLogin(): string | undefined {
-    const user = this.authService.getUser();
+    const user = this.authService?.getUser();
     if (user) {
       return user.login;
     }
-    // Tenta obter do localStorage (usuário funcional)
     const serviceUserStr = localStorage.getItem('service_user');
     if (serviceUserStr) {
       try {
@@ -450,8 +563,321 @@ export class SyncService {
    * Verifica se há novas releases no GitHub comparando com o Firestore
    */
   checkForUpdates(): Observable<boolean> {
-    // Implementação futura: comparar SHAs dos arquivos
     return of(false);
   }
-}
 
+  /**
+   * Sincroniza apenas uma demanda específica dos seus repositórios
+   * Evita rate limit ao sincronizar apenas os arquivos relacionados a uma release
+   */
+  syncDemand(demandId: string): Observable<{ synced: number; errors: string[] }> {
+    if (!this.githubService.hasValidToken()) {
+      return throwError(() => new Error('Nenhum token GitHub disponível. Faça login ou configure um token de serviço.'));
+    }
+
+    const demandIdUpper = demandId.toUpperCase();
+    this.notificationService.info(`Sincronizando release ${demandIdUpper}...`);
+
+    // Busca a release no localStorage para obter os repositórios
+    return this.localStorageReleaseService.getByDemandId(demandId).pipe(
+      take(1),
+      switchMap(existingRelease => {
+        if (!existingRelease || !existingRelease.repositories || existingRelease.repositories.length === 0) {
+          this.notificationService.warning(`Release ${demandIdUpper} não encontrada ou sem repositórios associados.`);
+          return of({ synced: 0, errors: [`Release ${demandIdUpper} não tem repositórios configurados`] });
+        }
+
+        // Busca releases apenas nos repositórios dessa demanda
+        const repoUrls = existingRelease.repositories.map(r => r.url);
+        const repoFullNames = repoUrls
+          .map(url => {
+            const repoInfo = this.githubService.parseRepositoryUrl(url);
+            return repoInfo ? `${repoInfo.owner}/${repoInfo.repo}` : null;
+          })
+          .filter((name): name is string => name !== null);
+
+        if (repoFullNames.length === 0) {
+          return of({ synced: 0, errors: [`Nenhum repositório válido para ${demandIdUpper}`] });
+        }
+
+        // Busca releases apenas nesses repositórios específicos
+        const releaseFileName = `release_${demandIdUpper}.md`;
+        const filePath = `releases/${releaseFileName}`;
+
+        const operations = repoFullNames.map(repoFullName => {
+          const repoInfo = this.githubService.parseRepositoryUrl(`https://github.com/${repoFullName}`);
+          if (!repoInfo) {
+            return of({ success: false, error: `URL inválida: ${repoFullName}` });
+          }
+
+          // Tenta buscar da feature/upsert-release primeiro (prioridade)
+          const upsertBranch$ = this.githubService.getReleaseFileContent(repoInfo.owner, repoInfo.repo, filePath, 'feature/upsert-release').pipe(
+            map(content => ({ content, branch: 'feature/upsert-release' as const, repo: repoFullName })),
+            catchError(() => of(null))
+          );
+
+          // Se não encontrar, tenta develop
+          const developBranch$ = this.githubService.getReleaseFileContent(repoInfo.owner, repoInfo.repo, filePath, 'develop').pipe(
+            map(content => ({ content, branch: 'develop' as const, repo: repoFullName })),
+            catchError(() => of(null))
+          );
+
+          return forkJoin([upsertBranch$, developBranch$]).pipe(
+            switchMap(([upsertResult, developResult]) => {
+              // Prioriza feature/upsert-release
+              const result = upsertResult?.content ? upsertResult : developResult;
+              
+              if (!result || !result.content) {
+                return of({ success: false, error: `Arquivo não encontrado em ${repoFullName}` });
+              }
+
+              const releaseData = this.releaseService.parseMarkdownToRelease(result.content, releaseFileName, repoFullName);
+              
+              if (!releaseData.demandId || releaseData.demandId.toUpperCase() !== demandIdUpper) {
+                return of({ success: false, error: `DemandId não confere: ${releaseData.demandId}` });
+              }
+
+              const isUpsertBranch = result.branch === 'feature/upsert-release';
+              
+              // Busca o conteúdo dos scripts do GitHub APENAS se houver scripts referenciados no .md
+              // IMPORTANTE: Só busca scripts que foram parseados da tabela de scripts do markdown
+              if (releaseData.scripts && releaseData.scripts.length > 0) {
+                // Filtra apenas scripts com nome válido (garantindo que vieram do parse do markdown)
+                const validScripts = releaseData.scripts.filter(script => script.name && script.name.trim() !== '');
+                if (validScripts.length > 0) {
+                  const scriptOperations = validScripts.map(script => {
+                    // Busca da pasta scripts/${demandId}/ apenas para scripts que estão no markdown
+                    // O script.name vem do parse da tabela de scripts do .md
+                    const scriptPath = `scripts/${demandIdUpper}/${script.name}`;
+                    return this.githubService.getFileContent(repoInfo.owner, repoInfo.repo, scriptPath, result.branch).pipe(
+                    map((scriptContent: string | null) => {
+                      if (scriptContent) {
+                        script.content = scriptContent;
+                      }
+                      return script;
+                    }),
+                    catchError((err: any) => {
+                      // 404 = arquivo não existe, isso é OK (pode ser novo)
+                      if (err.status !== 404) {
+                        console.warn(`[SyncService] ⚠️ Erro ao buscar script ${script.name}:`, err.message);
+                      }
+                      return of(script);
+                    })
+                  );
+                  });
+                  
+                  return forkJoin(scriptOperations).pipe(
+                    switchMap((scriptsWithContent) => {
+                      // Atualiza apenas os scripts que foram buscados, mantendo os outros
+                      if (releaseData.scripts) {
+                        releaseData.scripts = releaseData.scripts.map(script => {
+                          const found = scriptsWithContent.find(s => s.name === script.name);
+                          return found || script;
+                        });
+                      } else {
+                        releaseData.scripts = scriptsWithContent;
+                      }
+                      // Continua com o processamento normal da release
+                      return this.processReleaseDataForSyncDemand(releaseData, existingRelease, repoInfo, result.branch, demandIdUpper, isUpsertBranch, filePath);
+                    })
+                  );
+                }
+              }
+              
+              // Se não há scripts, continua normalmente
+              return this.processReleaseDataForSyncDemand(releaseData, existingRelease, repoInfo, result.branch, demandIdUpper, isUpsertBranch, filePath);
+            })
+          );
+        });
+
+        return forkJoin(operations).pipe(
+          map(results => {
+            const synced = results.filter(r => r.success).length;
+            const errors = results
+              .filter((r): r is { success: false; error: string } => !r.success && 'error' in r)
+              .map(r => r.error);
+
+            if (synced > 0) {
+              this.notificationService.success(`Release ${demandIdUpper} sincronizada com sucesso!`);
+            } else if (errors.length > 0) {
+              this.notificationService.error(`Erro ao sincronizar ${demandIdUpper}: ${errors[0]}`);
+            }
+
+            return { synced, errors };
+          }),
+          catchError(error => {
+            console.error(`[SyncService] Erro ao sincronizar demanda ${demandIdUpper}:`, error);
+            this.notificationService.error(`Erro ao sincronizar: ${error.message}`);
+            return throwError(() => error);
+          })
+        );
+      })
+    );
+  }
+
+  /**
+   * Método auxiliar para processar release após buscar scripts (usado em syncDemand)
+   */
+  private processReleaseDataForSyncDemand(
+    releaseData: Partial<Release>,
+    existingRelease: Release | null,
+    repoInfo: { owner: string; repo: string },
+    branch: string,
+    demandIdUpper: string,
+    isUpsertBranch: boolean,
+    filePath: string
+  ): Observable<{ success: boolean; release?: Release; error?: string }> {
+    const repoFullName = `${repoInfo.owner}/${repoInfo.repo}`;
+    
+    // Busca commits
+    const lastCommit$ = this.githubService.getFileLastCommit(repoInfo.owner, repoInfo.repo, filePath, branch);
+    const firstCommit$ = existingRelease 
+      ? of(null)
+      : this.githubService.getFileFirstCommit(repoInfo.owner, repoInfo.repo, filePath, branch);
+    
+    return forkJoin([lastCommit$, firstCommit$]).pipe(
+      switchMap(([lastCommit, firstCommit]) => {
+        const createdBy = existingRelease?.createdBy || firstCommit?.author || this.getCurrentUserLogin();
+        const updatedBy = lastCommit?.author || existingRelease?.updatedBy || this.getCurrentUserLogin();
+        const createdAt = existingRelease?.createdAt || firstCommit?.date || new Date();
+        const updatedAt = (isUpsertBranch || !existingRelease) && lastCommit?.date 
+          ? lastCommit.date 
+          : (existingRelease?.updatedAt || new Date());
+        
+        // Mescla repositórios
+        const existingRepos = existingRelease?.repositories || [];
+        const newRepos = releaseData.repositories || [];
+        const mergedRepos = [...existingRepos];
+        
+        const existingRepoIndex = mergedRepos.findIndex(r => 
+          r.url.includes(repoFullName) || r.name === repoFullName
+        );
+        
+        if (existingRepoIndex === -1) {
+          mergedRepos.push({
+            id: `repo-${Date.now()}`,
+            url: `https://github.com/${repoFullName}`,
+            name: repoFullName,
+            impact: 'Release sincronizada do GitHub',
+            releaseBranch: branch
+          });
+        } else {
+          if (branch === 'feature/upsert-release') {
+            mergedRepos[existingRepoIndex].releaseBranch = branch;
+          }
+        }
+        
+        const finalId = existingRelease?.id || `REL-${demandIdUpper}`;
+        
+        const release: Release = isUpsertBranch ? {
+          id: finalId,
+          demandId: releaseData.demandId || demandIdUpper,
+          title: releaseData.title || '',
+          description: releaseData.description || '',
+          responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
+          secrets: releaseData.secrets || [],
+          scripts: releaseData.scripts || [],
+          repositories: mergedRepos,
+          observations: releaseData.observations || '',
+          createdAt: createdAt,
+          updatedAt: updatedAt,
+          createdBy: createdBy,
+          updatedBy: updatedBy,
+          isVersioned: false
+        } : {
+          id: finalId,
+          demandId: releaseData.demandId || demandIdUpper,
+          title: releaseData.title || existingRelease?.title || '',
+          description: releaseData.description || existingRelease?.description || '',
+          responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
+          secrets: releaseData.secrets || existingRelease?.secrets || [],
+          scripts: releaseData.scripts || existingRelease?.scripts || [],
+          repositories: mergedRepos,
+          observations: releaseData.observations || existingRelease?.observations || '',
+          createdAt: createdAt,
+          updatedAt: updatedAt,
+          createdBy: createdBy,
+          updatedBy: updatedBy,
+          isVersioned: true
+        };
+
+        return this.localStorageReleaseService.syncRelease(release).pipe(
+          map(() => ({ success: true, release })),
+          catchError(error => {
+            console.error(`[SyncService] Erro ao sincronizar release ${demandIdUpper}:`, error);
+            return of({ success: false, error: `Erro ao salvar: ${error.message}` });
+          })
+        );
+      }),
+      catchError(error => {
+        console.warn(`[SyncService] Erro ao buscar commits para ${demandIdUpper}:`, error);
+        // Tenta salvar mesmo sem commits
+        const currentUser = this.getCurrentUserLogin();
+        const finalId = existingRelease?.id || `REL-${demandIdUpper}`;
+        const repoFullName = `${repoInfo.owner}/${repoInfo.repo}`;
+        
+        // Mescla repositórios novamente
+        const existingReposError = existingRelease?.repositories || [];
+        const newReposError = releaseData.repositories || [];
+        const mergedReposError = [...existingReposError];
+        
+        const existingRepoIndexError = mergedReposError.findIndex(r => 
+          r.url.includes(repoFullName) || r.name === repoFullName
+        );
+        
+        if (existingRepoIndexError === -1) {
+          mergedReposError.push({
+            id: `repo-${Date.now()}`,
+            url: `https://github.com/${repoFullName}`,
+            name: repoFullName,
+            impact: 'Release sincronizada do GitHub',
+            releaseBranch: branch
+          });
+        } else {
+          if (branch === 'feature/upsert-release') {
+            mergedReposError[existingRepoIndexError].releaseBranch = branch;
+          }
+        }
+        
+        const release: Release = isUpsertBranch ? {
+          id: finalId,
+          demandId: releaseData.demandId || demandIdUpper,
+          title: releaseData.title || '',
+          description: releaseData.description || '',
+          responsible: releaseData.responsible || { dev: '', functional: '', lt: '', sre: '' },
+          secrets: releaseData.secrets || [],
+          scripts: releaseData.scripts || [],
+          repositories: mergedReposError,
+          observations: releaseData.observations || '',
+          createdAt: existingRelease?.createdAt || new Date(),
+          updatedAt: new Date(),
+          createdBy: existingRelease?.createdBy || currentUser,
+          updatedBy: currentUser || existingRelease?.updatedBy,
+          isVersioned: false
+        } : {
+          id: finalId,
+          demandId: releaseData.demandId || demandIdUpper,
+          title: releaseData.title || existingRelease?.title || '',
+          description: releaseData.description || existingRelease?.description || '',
+          responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
+          secrets: releaseData.secrets || existingRelease?.secrets || [],
+          scripts: releaseData.scripts || existingRelease?.scripts || [],
+          repositories: mergedReposError,
+          observations: releaseData.observations || existingRelease?.observations || '',
+          createdAt: existingRelease?.createdAt || new Date(),
+          updatedAt: existingRelease?.updatedAt || new Date(),
+          createdBy: existingRelease?.createdBy || currentUser,
+          updatedBy: existingRelease?.updatedBy || currentUser,
+          isVersioned: true
+        };
+        
+        return this.localStorageReleaseService.syncRelease(release).pipe(
+          map(() => ({ success: true, release })),
+          catchError(syncError => {
+            return of({ success: false, error: `Erro ao salvar: ${syncError.message}` });
+          })
+        );
+      })
+    );
+  }
+}

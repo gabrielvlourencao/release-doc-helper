@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
-import { Observable, from, throwError, of, forkJoin } from 'rxjs';
-import { map, catchError, switchMap } from 'rxjs/operators';
+import { Observable, from, throwError, of, forkJoin, timer } from 'rxjs';
+import { map, catchError, switchMap, tap } from 'rxjs/operators';
 import { Octokit } from '@octokit/rest';
 import { GitHubAuthService } from './github-auth.service';
 
@@ -333,27 +333,176 @@ export class GitHubService {
       return throwError(() => new Error('Nenhum token disponível'));
     }
 
-    // Primeiro, tenta obter o SHA do arquivo se existir
-    return this.getFileSha(owner, repo, path, branch).pipe(
-      switchMap((sha: string | null) => {
-        // Codifica conteúdo UTF-8 para base64
-        const fileContent = this.encodeBase64UTF8(content);
-        
+    // Função auxiliar para tentar criar/atualizar com retry em caso de erro 409
+    const tryCreateOrUpdate = (retryCount: number = 0): Observable<void> => {
+      // Primeiro, obtém o SHA do arquivo se existir
+      return this.getFileSha(owner, repo, path, branch).pipe(
+        switchMap((sha: string | null) => {
+          // Codifica conteúdo UTF-8 para base64
+          const fileContent = this.encodeBase64UTF8(content);
+          
+          return from(
+            octokit.repos.createOrUpdateFileContents({
+              owner,
+              repo,
+              path,
+              message,
+              content: fileContent,
+              branch,
+              ...(sha ? { sha } : {}) // Inclui SHA apenas se o arquivo existir
+            })
+          );
+        }),
+        map(() => void 0 as void),
+        catchError((error: any) => {
+          // Erro 409 = SHA não corresponde (arquivo foi modificado)
+          // Tenta novamente até 2 vezes, buscando o SHA atualizado
+          if (error.status === 409 && retryCount < 2) {
+            console.warn(`[createOrUpdateFile] SHA conflito (409) ao atualizar ${path}, tentando novamente (tentativa ${retryCount + 1}/2)...`);
+            // Espera um pouco antes de tentar novamente (500ms * número de tentativa)
+            // Isso ajuda quando múltiplos arquivos estão sendo atualizados simultaneamente
+            return timer((retryCount + 1) * 500).pipe(
+              switchMap(() => tryCreateOrUpdate(retryCount + 1))
+            );
+          }
+          console.error('Erro ao criar/atualizar arquivo:', error);
+          return throwError(() => error);
+        })
+      );
+    };
+
+    return tryCreateOrUpdate();
+  }
+
+  /**
+   * Cria um único commit com múltiplos arquivos
+   * Útil para versionar release + scripts em um único commit
+   */
+  createSingleCommitWithMultipleFiles(
+    owner: string,
+    repo: string,
+    branch: string,
+    message: string,
+    files: Array<{ path: string; content: string; mode?: '100644' | '100755' | '040000' | '160000' | '120000' }>
+  ): Observable<void> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    // 1. Obtém o SHA atual da branch
+    return from(
+      octokit.git.getRef({
+        owner,
+        repo,
+        ref: `heads/${branch}`
+      })
+    ).pipe(
+      switchMap((refResponse: any) => {
+        const commitSha = refResponse.data.object.sha;
+
+        // 2. Obtém o commit para pegar o SHA da árvore
         return from(
-          octokit.repos.createOrUpdateFileContents({
+          octokit.git.getCommit({
             owner,
             repo,
-            path,
-            message,
-            content: fileContent,
-            branch,
-            ...(sha ? { sha } : {}) // Inclui SHA apenas se o arquivo existir
+            commit_sha: commitSha
+          })
+        ).pipe(
+          switchMap((commitResponse: any) => {
+            const baseTreeSha = commitResponse.data.tree.sha;
+
+                // 3. Cria blobs para cada arquivo
+                const fileOperations = files.map(file => {
+                  const contentBase64 = this.encodeBase64UTF8(file.content);
+                  return from(
+                    octokit.git.createBlob({
+                      owner,
+                      repo,
+                      content: contentBase64,
+                      encoding: 'base64'
+                    })
+                  ).pipe(
+                    map((blobResponse: any) => ({
+                      path: file.path,
+                      mode: (file.mode || '100644') as '100644' | '100755' | '040000' | '160000' | '120000',
+                      type: 'blob' as const,
+                      sha: blobResponse.data.sha
+                    }))
+                  );
+                });
+
+            return forkJoin(fileOperations).pipe(
+              switchMap((treeEntries) => {
+                // 4. Cria a nova árvore usando base_tree (a API faz merge automaticamente)
+                // Passamos apenas as entradas que queremos adicionar/atualizar
+                return from(
+                  octokit.git.createTree({
+                    owner,
+                    repo,
+                    base_tree: baseTreeSha,
+                    tree: treeEntries
+                  })
+                ).pipe(
+                  switchMap((treeResult: any) => {
+                    const newTreeSha = treeResult.data.sha;
+
+                    // 5. Cria o commit
+                    return from(
+                      octokit.git.createCommit({
+                        owner,
+                        repo,
+                        message,
+                        tree: newTreeSha,
+                        parents: [commitSha]
+                      })
+                    ).pipe(
+                      switchMap((commitResult: any) => {
+                        const newCommitSha = commitResult.data.sha;
+
+                        // 6. Obtém o SHA atual da branch novamente antes de atualizar (para evitar race conditions)
+                        return from(
+                          octokit.git.getRef({
+                            owner,
+                            repo,
+                            ref: `heads/${branch}`
+                          })
+                        ).pipe(
+                          switchMap((currentRef: any) => {
+                            const currentSha = currentRef.data.object.sha;
+                            
+                            // Se o SHA mudou desde que obtivemos inicialmente, o commit que criamos não é válido
+                            // Precisa criar um novo commit baseado no SHA atual
+                            if (currentSha !== commitSha) {
+                              console.warn(`[createSingleCommitWithMultipleFiles] Branch ${branch} foi atualizada durante a operação, recriando commit...`);
+                              // Retorna erro para que o método seja chamado novamente pelo caller
+                              return throwError(() => new Error('Branch foi atualizada durante a operação. Tente novamente.'));
+                            }
+                            
+                            // Atualiza a referência normalmente
+                            return from(
+                              octokit.git.updateRef({
+                                owner,
+                                repo,
+                                ref: `heads/${branch}`,
+                                sha: newCommitSha,
+                                force: false
+                              })
+                            );
+                          })
+                        );
+                      })
+                    );
+                  })
+                );
+              })
+            );
           })
         );
       }),
-      map(() => void 0 as void),
+      map(() => void 0),
       catchError((error: any) => {
-        console.error('Erro ao criar/atualizar arquivo:', error);
+        console.error('Erro ao criar commit com múltiplos arquivos:', error);
         return throwError(() => error);
       })
     );
@@ -625,9 +774,46 @@ export class GitHubService {
 
   /**
    * Obtém o conteúdo de um arquivo de release de uma branch específica
+   * IMPORTANTE: Sempre busca do HEAD da branch especificada (conteúdo mais recente)
+   * Usa 'ref: branch' para garantir que busca do HEAD da branch, não de um commit específico
    */
   getReleaseFileContent(owner: string, repo: string, path: string, branch: string = 'develop'): Observable<string | null> {
-    return this.getFileContent(owner, repo, path, branch);
+    console.log(`[GitHubService] 🔍 Buscando conteúdo mais recente de ${path} na branch ${branch} do repositório ${owner}/${repo}`);
+    // Busca do HEAD da branch (sempre o conteúdo mais recente)
+    return this.getFileContent(owner, repo, path, branch).pipe(
+      tap(content => {
+        if (content) {
+          console.log(`[GitHubService] ✅ Conteúdo encontrado na branch ${branch}: ${content.length} caracteres`);
+          // Log das primeiras linhas para debug
+          const firstLines = content.split('\n').slice(0, 5).join('\n');
+          console.log(`[GitHubService] 📄 Primeiras 5 linhas do conteúdo do GitHub:\n${firstLines}`);
+          
+          // Log: Verifica se tem scripts e secrets no markdown
+          const hasScriptsSection = content.includes('## 4.') && content.includes('Scripts');
+          const hasSecretsSection = content.includes('## 3.') && content.includes('Keys') || content.includes('Secrets');
+          const scriptsMatches = content.match(/\|\s*([^|]+\.sql)/gi);
+          const secretsMatches = content.match(/\|\s*QAS\s*\||\|\s*PRD\s*\||\|\s*DEV\s*\|/gi);
+          
+          console.log(`[GitHubService] 📊 Análise do markdown:`, {
+            temScriptsSection: hasScriptsSection,
+            temSecretsSection: hasSecretsSection,
+            matchesScripts: scriptsMatches?.length || 0,
+            matchesSecrets: secretsMatches?.length || 0,
+            totalLinhas: content.split('\n').length
+          });
+        } else {
+          console.warn(`[GitHubService] ⚠️ Conteúdo vazio para ${path} na branch ${branch}`);
+        }
+      }),
+      catchError(error => {
+        console.error(`[GitHubService] ❌ Erro ao buscar conteúdo de ${path} na branch ${branch}:`, {
+          status: error.status,
+          message: error.message,
+          url: error.request?.url || 'N/A'
+        });
+        return throwError(() => error);
+      })
+    );
   }
 
   /**
@@ -660,8 +846,24 @@ export class GitHubService {
           
           return forkJoin([developReleases$, upsertReleases$]).pipe(
             map(([developReleases, upsertReleases]) => {
-              // Combina releases de ambas as branches
-              const allReleases = [...developReleases, ...upsertReleases];
+              // Cria um mapa para priorizar releases da feature/upsert-release
+              // Quando uma release existe em ambas as branches, prioriza a versão da feature/upsert-release
+              const releaseMap = new Map<string, { name: string; path: string; sha: string; branch: string }>();
+              
+              // Primeiro adiciona releases da develop
+              developReleases.forEach(release => {
+                releaseMap.set(release.name, release);
+              });
+              
+              // Depois sobrescreve com releases da feature/upsert-release (prioridade)
+              // Isso garante que se uma release existe em ambas as branches, 
+              // a versão da feature/upsert-release será mantida (versão mais recente em edição)
+              upsertReleases.forEach(release => {
+                releaseMap.set(release.name, release);
+              });
+              
+              // Converte o mapa de volta para array
+              const allReleases = Array.from(releaseMap.values());
               return { repo: repo.full_name, releases: allReleases };
             }),
             catchError(err => {

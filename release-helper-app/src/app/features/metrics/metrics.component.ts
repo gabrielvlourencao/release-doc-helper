@@ -375,36 +375,21 @@ export class MetricsComponent implements OnInit, OnDestroy {
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
       .slice(0, 5);
 
-    // Conta releases com commits pendentes e carrega PRs abertos
+    // Carrega PRs abertos
     if (this.githubService.hasValidToken()) {
-      const versionedReleasesList = releases.filter(r => r.isVersioned && r.repositories && r.repositories.length > 0);
-      
-      // Verifica commits pendentes
-      const pendingChecks = versionedReleasesList.map(release => 
-        this.releaseService.hasPendingCommits(release).pipe(
-          map(hasPending => hasPending ? 1 : 0),
-          takeUntil(this.destroy$)
-        )
-      );
-
       // Carrega PRs abertos
       const prs$ = this.versioningService.getOpenPRs().pipe(
         takeUntil(this.destroy$)
       );
 
-      // Combina todas as verificações
-      const pendingCount$ = pendingChecks.length > 0 
-        ? forkJoin(pendingChecks).pipe(map(counts => counts.reduce<number>((sum, count) => sum + count, 0)))
-        : of(0);
-
-      forkJoin([pendingCount$, prs$])
+      prs$
         .pipe(takeUntil(this.destroy$))
-        .subscribe(([pendingCommitsCount, prs]) => {
+        .subscribe((prs) => {
           this.metrics = {
             totalReleases,
             versionedReleases,
             nonVersionedReleases,
-            pendingCommitsReleases: pendingCommitsCount,
+            pendingCommitsReleases: 0, // Funcionalidade removida
             openPRs: prs.length,
             releasesByRepo,
             releasesByResponsible,

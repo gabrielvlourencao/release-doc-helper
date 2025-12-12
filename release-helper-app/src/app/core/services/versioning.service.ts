@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { Observable, forkJoin, throwError, of } from 'rxjs';
+import { Observable, forkJoin, throwError, of, timer } from 'rxjs';
 import { switchMap, map, catchError } from 'rxjs/operators';
 import { Release } from '../../models';
 import { GitHubService } from './github.service';
@@ -80,40 +80,57 @@ export class VersioningService {
           results.errors?.push(`Erro ao criar branch em ${repo}: ${err.message}`);
           return of(void 0);
         }),
-        // 2. Verifica se já tem commits na branch (se não, cria/atualiza os arquivos)
+        // 2. Cria um único commit com o documento e todos os scripts
         switchMap(() => {
-          // Se a release já foi criada/editada, os arquivos já devem estar na branch
-          // Mas vamos garantir que está tudo atualizado
           const markdown = this.releaseService.generateMarkdown(release);
           const filePath = `releases/release_${release.demandId}.md`;
           const message = `docs: versiona release ${release.demandId}`;
 
-          return this.githubService.createOrUpdateFile(owner, repo, filePath, markdown, message, branchName).pipe(
-            catchError(err => {
-              results.errors?.push(`Erro ao atualizar arquivo em ${repo}: ${err.message}`);
-              return of(void 0);
-            })
-          );
-        }),
-        // 3. Atualiza os scripts se houver
-        switchMap(() => {
-          if (release.scripts.length === 0) return of(void 0);
+          // Prepara lista de arquivos para o commit único
+          const filesToCommit: Array<{ path: string; content: string }> = [
+            { path: filePath, content: markdown }
+          ];
 
-          const scriptOperations = release.scripts
-            .filter(script => script.content)
-            .map(script => {
-              const scriptPath = `scripts/${release.demandId}/${script.name}`;
-              const message = `docs: versiona script ${script.name} para release ${release.demandId}`;
+          // Adiciona scripts se houver
+          const scriptsWithContent = release.scripts.filter(script => script.content);
+          const scriptsWithoutContent = release.scripts.filter(script => !script.content);
+          
+          if (scriptsWithoutContent.length > 0) {
+            console.warn(`[versionRelease] ${scriptsWithoutContent.length} script(s) sem conteúdo serão ignorados:`, 
+              scriptsWithoutContent.map(s => s.name).join(', '));
+          }
+          
+          scriptsWithContent.forEach(script => {
+            const scriptPath = `scripts/${release.demandId}/${script.name}`;
+            filesToCommit.push({ path: scriptPath, content: script.content! });
+          });
+          
+          console.log(`[versionRelease] Preparando commit com ${filesToCommit.length} arquivo(s): 1 documento + ${scriptsWithContent.length} script(s)`);
 
-              return this.githubService.createOrUpdateFile(owner, repo, scriptPath, script.content!, message, branchName).pipe(
-                catchError(err => {
-                  results.errors?.push(`Erro ao atualizar script ${script.name} em ${repo}: ${err.message}`);
-                  return of(void 0);
-                })
-              );
-            });
-
-          return forkJoin(scriptOperations.length > 0 ? scriptOperations : [of(void 0)]);
+          // Cria um único commit com todos os arquivos (com retry para lidar com race conditions)
+          const tryCreateCommit = (retryCount: number = 0): Observable<void> => {
+            return this.githubService.createSingleCommitWithMultipleFiles(
+              owner,
+              repo,
+              branchName,
+              message,
+              filesToCommit
+            ).pipe(
+              catchError((err: any) => {
+                // Se a branch foi atualizada durante a operação, tenta novamente (até 2 vezes)
+                if ((err.message?.includes('atualizada durante a operação') || err.status === 422) && retryCount < 2) {
+                  console.warn(`[versionRelease] Tentando novamente criar commit (tentativa ${retryCount + 1}/2)...`);
+                  return timer(1000 * (retryCount + 1)).pipe(
+                    switchMap(() => tryCreateCommit(retryCount + 1))
+                  );
+                }
+                results.errors?.push(`Erro ao criar commit em ${repo}: ${err.message || err}`);
+                return of(void 0);
+              })
+            );
+          };
+          
+          return tryCreateCommit();
         }),
         // 4. Cria o Pull Request da branch feature/upsert-release
         switchMap(() => {
