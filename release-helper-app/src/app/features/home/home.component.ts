@@ -90,18 +90,23 @@ import { ReleaseService, SyncService, GitHubService, NotificationService, LocalS
                   </div>
                   
                   <div class="mt-5 pt-4 border-t border-blue-200">
-                    <button 
-                      (click)="syncWithGitHub()" 
-                      [disabled]="isSyncing || !canSync"
-                      class="inline-flex items-center gap-2 bg-blue-600 text-white px-5 py-2.5 rounded-xl font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 shadow-sm hover:shadow-md">
-                      <svg *ngIf="!isSyncing" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-                      </svg>
-                      <svg *ngIf="isSyncing" class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-                      </svg>
-                      <span>{{ isSyncing ? 'Sincronizando...' : 'Sincronizar com GitHub' }}</span>
-                    </button>
+                    <div class="flex items-center gap-3">
+                      <button 
+                        (click)="syncWithGitHub()" 
+                        [disabled]="isSyncing || !canSync"
+                        class="inline-flex items-center gap-2 bg-blue-600 text-white px-5 py-2.5 rounded-xl font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 shadow-sm hover:shadow-md">
+                        <svg *ngIf="!isSyncing" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                        <svg *ngIf="isSyncing" class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                        <span>{{ isSyncing ? 'Sincronizando...' : 'Sincronizar com GitHub' }}</span>
+                      </button>
+                      <span *ngIf="lastSyncDate && !isSyncing" class="text-xs text-blue-700">
+                        Última sincronização: {{ lastSyncDate | date:'dd/MM/yy HH:mm' }}
+                      </span>
+                    </div>
                     <p *ngIf="!canSync" class="text-xs text-blue-700 mt-3 flex items-center gap-1.5 bg-blue-100 px-3 py-2 rounded-lg border border-blue-200">
                       <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
@@ -379,7 +384,8 @@ import { ReleaseService, SyncService, GitHubService, NotificationService, LocalS
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
                   </svg>
                 </button>
-                <span class="text-xs text-slate-400 font-medium">
+                <span class="text-xs text-slate-400 font-medium flex items-center gap-1">
+                  <span class="text-slate-500">Última sincronização:</span>
                   {{ getFormattedDate(release.updatedAt) }}
                 </span>
               </div>
@@ -428,6 +434,7 @@ export class HomeComponent implements OnInit, OnDestroy {
   isSyncing = false;
   canSync = false;
   syncingDemands = new Set<string>();
+  lastSyncDate?: Date;
 
   private destroy$ = new Subject<void>();
 
@@ -444,6 +451,8 @@ export class HomeComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
+    this.loadLastSyncDate();
+    
     // Se localStorage estiver vazio e tiver token, sincroniza automaticamente
     if (!this.localStorageReleaseService.hasReleases() && this.githubService.hasValidToken()) {
       this.isSyncing = true;
@@ -451,6 +460,7 @@ export class HomeComponent implements OnInit, OnDestroy {
         next: (result) => {
           this.isSyncing = false;
           this.loadReleases();
+          this.loadLastSyncDate();
           if (result.synced > 0) {
             this.notificationService.success(`Sincronização automática concluída! ${result.synced} release(s) carregada(s).`);
           }
@@ -480,6 +490,17 @@ export class HomeComponent implements OnInit, OnDestroy {
           .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
           .slice(0, 6);
       });
+  }
+
+  loadLastSyncDate(): void {
+    const lastSyncStr = localStorage.getItem('last_sync_date');
+    if (lastSyncStr) {
+      try {
+        this.lastSyncDate = new Date(lastSyncStr);
+      } catch {
+        this.lastSyncDate = undefined;
+      }
+    }
   }
 
   openRelease(release: Release): void {
@@ -554,10 +575,22 @@ export class HomeComponent implements OnInit, OnDestroy {
       return;
     }
 
+    // Verifica se já há sincronização em andamento em outra tela
+    const syncInProgress = localStorage.getItem('sync_in_progress');
+    if (syncInProgress === 'true') {
+      this.notificationService.info('Sincronização já em andamento em outra tela. Aguarde...');
+      return;
+    }
+
+    // Marca que está sincronizando
+    localStorage.setItem('sync_in_progress', 'true');
+
     this.isSyncing = true;
     this.syncService.syncFromGitHub().subscribe({
       next: (result) => {
         this.isSyncing = false;
+        // Remove a flag de sincronização em andamento
+        localStorage.removeItem('sync_in_progress');
         if (result.synced > 0 || result.removed > 0) {
           let message = 'Sincronização concluída!';
           if (result.synced > 0) {
@@ -569,12 +602,15 @@ export class HomeComponent implements OnInit, OnDestroy {
           this.notificationService.success(message);
           // Recarrega as releases para mostrar as atualizadas
           this.loadReleases();
+          this.loadLastSyncDate();
         } else if (result.errors && result.errors.length > 0) {
           this.notificationService.warning('Sincronização concluída com alguns erros. Verifique o console.');
         }
       },
       error: (error) => {
         this.isSyncing = false;
+        // Remove a flag de sincronização em andamento mesmo em caso de erro
+        localStorage.removeItem('sync_in_progress');
         const errorMessage = error instanceof Error ? error.message : String(error);
         this.notificationService.error(`Erro ao sincronizar: ${errorMessage}`);
       }

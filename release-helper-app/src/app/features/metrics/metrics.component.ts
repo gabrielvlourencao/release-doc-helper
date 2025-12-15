@@ -263,8 +263,20 @@ export class MetricsComponent implements OnInit, OnDestroy {
       return; // Para aqui - usa o cache, não faz mais nada
     }
     
-    // Se não tem cache, calcula pela primeira vez
-    this.loadMetrics();
+    // Se não tem cache, verifica se há releases no localStorage
+    // Se houver, calcula métricas direto do localStorage SEM buscar do GitHub
+    this.releaseService.getAll()
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(releases => {
+        if (releases && releases.length > 0) {
+          // Há releases no localStorage, calcula métricas direto de lá
+          // Não precisa buscar do GitHub
+          this.calculateMetrics(releases, true);
+        } else {
+          // Não há releases no localStorage, calcula métricas vazias
+          this.calculateMetrics([], true);
+        }
+      });
   }
 
   ngOnDestroy(): void {
@@ -375,14 +387,11 @@ export class MetricsComponent implements OnInit, OnDestroy {
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
       .slice(0, 5);
 
-    // Carrega PRs abertos
-    if (this.githubService.hasValidToken()) {
-      // Carrega PRs abertos
-      const prs$ = this.versioningService.getOpenPRs().pipe(
-        takeUntil(this.destroy$)
-      );
-
-      prs$
+    // Calcula métricas com os dados do localStorage
+    // PRs abertos só são buscados se houver token e releases
+    if (this.githubService.hasValidToken() && releases.length > 0) {
+      // Carrega PRs abertos apenas se necessário (tem token e há releases)
+      this.versioningService.getOpenPRs()
         .pipe(takeUntil(this.destroy$))
         .subscribe((prs) => {
           this.metrics = {
@@ -403,6 +412,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
           }
         });
     } else {
+      // Sem token ou sem releases, calcula métricas sem buscar PRs do GitHub
       this.metrics = {
         totalReleases,
         versionedReleases,
@@ -432,10 +442,23 @@ export class MetricsComponent implements OnInit, OnDestroy {
       return;
     }
 
+    // Verifica se já há sincronização em andamento na outra tela (demandas)
+    // Usa uma flag no localStorage para evitar sincronizações duplicadas
+    const syncInProgress = localStorage.getItem('sync_in_progress');
+    if (syncInProgress === 'true') {
+      this.notificationService.info('Sincronização já em andamento na tela de Demandas. Aguarde...');
+      return;
+    }
+
+    // Marca que está sincronizando
+    localStorage.setItem('sync_in_progress', 'true');
+
     this.isSyncing = true;
     this.syncService.syncFromGitHub().subscribe({
       next: (result) => {
         this.isSyncing = false;
+        // Remove a flag de sincronização em andamento
+        localStorage.removeItem('sync_in_progress');
         
         if (result.synced > 0 || result.removed > 0) {
           let message = 'Sincronização concluída!';
@@ -461,6 +484,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
       },
       error: (error) => {
         this.isSyncing = false;
+        // Remove a flag de sincronização em andamento mesmo em caso de erro
+        localStorage.removeItem('sync_in_progress');
         const errorMessage = error instanceof Error ? error.message : String(error);
         this.notificationService.error(`Erro ao sincronizar: ${errorMessage}`);
       }

@@ -294,6 +294,9 @@ export class SyncService {
                           }
                         }
 
+                        // Salva a data da última sincronização geral no localStorage
+                        localStorage.setItem('last_sync_date', new Date().toISOString());
+                        
                         return { synced, removed, errors };
                       })
                     );
@@ -354,12 +357,15 @@ export class SyncService {
             switchMap(([lastCommit, firstCommit]) => {
               const isVersioned = branch === 'develop';
               
+              // SEMPRE usa dados do commit para updatedAt/updatedBy quando sincronizando
+              // Não atualiza como se fosse edição local
               const createdBy = existingRelease?.createdBy || firstCommit?.author || this.getCurrentUserLogin();
-              const updatedBy = lastCommit?.author || existingRelease?.updatedBy || this.getCurrentUserLogin();
+              // updatedBy sempre vem do último commit (ou mantém o existente se não houver commit)
+              const updatedBy = lastCommit?.author || existingRelease?.updatedBy;
               const createdAt = existingRelease?.createdAt || firstCommit?.date || new Date();
-              const updatedAt = (isUpsertBranch || !existingRelease) && lastCommit?.date 
-                ? lastCommit.date 
-                : (existingRelease?.updatedAt || new Date());
+              // updatedAt SEMPRE vem do último commit quando sincronizando (não usa data atual se não houver commit)
+              // Se não houver lastCommit ou lastCommit.date, mantém a data existente (não cria nova data)
+              const updatedAt = (lastCommit?.date) ? lastCommit.date : (existingRelease?.updatedAt || new Date());
               
               // Mescla repositórios
               const existingRepos = existingRelease?.repositories || [];
@@ -426,10 +432,11 @@ export class SyncService {
                 title: releaseData.title || existingRelease?.title || '',
                 description: releaseData.description || existingRelease?.description || '',
                 responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
+                // CORREÇÃO: usa dados do parse do markdown quando disponíveis (secrets e observations)
                 secrets: releaseData.secrets || existingRelease?.secrets || [],
                 scripts: releaseData.scripts || existingRelease?.scripts || [],
                 repositories: mergedRepos,
-                observations: releaseData.observations || existingRelease?.observations || '',
+                observations: releaseData.observations !== undefined ? releaseData.observations : (existingRelease?.observations || ''),
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 createdBy: createdBy,
@@ -495,6 +502,7 @@ export class SyncService {
               
               const finalId = existingRelease?.id || releaseId;
               
+              // Em caso de erro, mantém dados existentes mas não atualiza updatedAt/updatedBy (não é edição local)
               const release: Release = isUpsertBranch ? {
                 id: finalId,
                 demandId: releaseData.demandId || '',
@@ -506,9 +514,10 @@ export class SyncService {
                 repositories: mergedRepos,
                 observations: releaseData.observations || '',
                 createdAt: existingRelease?.createdAt || new Date(),
-                updatedAt: new Date(),
+                // Não atualiza updatedAt/updatedBy em caso de erro (mantém existentes)
+                updatedAt: existingRelease?.updatedAt || new Date(),
                 createdBy: existingRelease?.createdBy || currentUser,
-                updatedBy: currentUser,
+                updatedBy: existingRelease?.updatedBy,
                 isVersioned: false
               } : {
                 id: finalId,
@@ -519,11 +528,12 @@ export class SyncService {
                 secrets: releaseData.secrets || existingRelease?.secrets || [],
                 scripts: releaseData.scripts || existingRelease?.scripts || [],
                 repositories: mergedRepos,
-                observations: releaseData.observations || existingRelease?.observations || '',
+                observations: releaseData.observations !== undefined ? releaseData.observations : (existingRelease?.observations || ''),
                 createdAt: existingRelease?.createdAt || new Date(),
+                // Não atualiza updatedAt/updatedBy em caso de erro (mantém existentes)
                 updatedAt: existingRelease?.updatedAt || new Date(),
                 createdBy: existingRelease?.createdBy || currentUser,
-                updatedBy: existingRelease?.updatedBy || currentUser,
+                updatedBy: existingRelease?.updatedBy,
                 isVersioned: true
               };
 
@@ -697,7 +707,9 @@ export class SyncService {
               .filter((r): r is { success: false; error: string } => !r.success && 'error' in r)
               .map(r => r.error);
 
+            // Salva a data da última sincronização individual no localStorage
             if (synced > 0) {
+              localStorage.setItem('last_sync_date', new Date().toISOString());
               this.notificationService.success(`Release ${demandIdUpper} sincronizada com sucesso!`);
             } else if (errors.length > 0) {
               this.notificationService.error(`Erro ao sincronizar ${demandIdUpper}: ${errors[0]}`);
@@ -737,12 +749,15 @@ export class SyncService {
     
     return forkJoin([lastCommit$, firstCommit$]).pipe(
       switchMap(([lastCommit, firstCommit]) => {
+        // SEMPRE usa dados do commit para updatedAt/updatedBy quando sincronizando
+        // Não atualiza como se fosse edição local
         const createdBy = existingRelease?.createdBy || firstCommit?.author || this.getCurrentUserLogin();
-        const updatedBy = lastCommit?.author || existingRelease?.updatedBy || this.getCurrentUserLogin();
+        // updatedBy sempre vem do último commit (ou mantém o existente se não houver commit)
+        const updatedBy = lastCommit?.author || existingRelease?.updatedBy;
         const createdAt = existingRelease?.createdAt || firstCommit?.date || new Date();
-        const updatedAt = (isUpsertBranch || !existingRelease) && lastCommit?.date 
-          ? lastCommit.date 
-          : (existingRelease?.updatedAt || new Date());
+        // updatedAt SEMPRE vem do último commit quando sincronizando (não usa data atual se não houver commit)
+        // Se não houver lastCommit ou lastCommit.date, mantém a data existente (não cria nova data)
+        const updatedAt = (lastCommit?.date) ? lastCommit.date : (existingRelease?.updatedAt || new Date());
         
         // Mescla repositórios
         const existingRepos = existingRelease?.repositories || [];
@@ -769,6 +784,8 @@ export class SyncService {
         
         const finalId = existingRelease?.id || `REL-${demandIdUpper}`;
         
+        // feature/upsert-release: sempre usa dados do GitHub (parse do markdown)
+        // develop: mescla - usa dados do GitHub quando disponíveis, senão mantém existentes
         const release: Release = isUpsertBranch ? {
           id: finalId,
           demandId: releaseData.demandId || demandIdUpper,
@@ -790,10 +807,11 @@ export class SyncService {
           title: releaseData.title || existingRelease?.title || '',
           description: releaseData.description || existingRelease?.description || '',
           responsible: releaseData.responsible || existingRelease?.responsible || { dev: '', functional: '', lt: '', sre: '' },
+          // CORREÇÃO: usa dados do parse do markdown quando disponíveis (secrets e observations)
           secrets: releaseData.secrets || existingRelease?.secrets || [],
           scripts: releaseData.scripts || existingRelease?.scripts || [],
           repositories: mergedRepos,
-          observations: releaseData.observations || existingRelease?.observations || '',
+          observations: releaseData.observations !== undefined ? releaseData.observations : (existingRelease?.observations || ''),
           createdAt: createdAt,
           updatedAt: updatedAt,
           createdBy: createdBy,
@@ -839,6 +857,7 @@ export class SyncService {
           }
         }
         
+        // Em caso de erro, mantém dados existentes mas não atualiza updatedAt/updatedBy (não é edição local)
         const release: Release = isUpsertBranch ? {
           id: finalId,
           demandId: releaseData.demandId || demandIdUpper,
@@ -850,9 +869,10 @@ export class SyncService {
           repositories: mergedReposError,
           observations: releaseData.observations || '',
           createdAt: existingRelease?.createdAt || new Date(),
-          updatedAt: new Date(),
+          // Não atualiza updatedAt/updatedBy em caso de erro (mantém existentes)
+          updatedAt: existingRelease?.updatedAt || new Date(),
           createdBy: existingRelease?.createdBy || currentUser,
-          updatedBy: currentUser || existingRelease?.updatedBy,
+          updatedBy: existingRelease?.updatedBy,
           isVersioned: false
         } : {
           id: finalId,
@@ -863,11 +883,12 @@ export class SyncService {
           secrets: releaseData.secrets || existingRelease?.secrets || [],
           scripts: releaseData.scripts || existingRelease?.scripts || [],
           repositories: mergedReposError,
-          observations: releaseData.observations || existingRelease?.observations || '',
+          observations: releaseData.observations !== undefined ? releaseData.observations : (existingRelease?.observations || ''),
           createdAt: existingRelease?.createdAt || new Date(),
+          // Não atualiza updatedAt/updatedBy em caso de erro (mantém existentes)
           updatedAt: existingRelease?.updatedAt || new Date(),
           createdBy: existingRelease?.createdBy || currentUser,
-          updatedBy: existingRelease?.updatedBy || currentUser,
+          updatedBy: existingRelease?.updatedBy,
           isVersioned: true
         };
         
