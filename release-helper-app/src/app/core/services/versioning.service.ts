@@ -71,17 +71,25 @@ export class VersioningService {
 
       const { owner, repo } = repoInfo;
       const branchName = `feature/upsert-release`;
-      const baseBranch = 'develop'; // Sempre develop, nunca main
+      const preferredBaseBranch = 'develop'; // Preferência por develop, mas aceita outras se não existir
 
       // 1. Garante que a branch feature/upsert-release existe (já deve ter commits da criação/edição)
-      return this.githubService.createBranch(owner, repo, branchName, baseBranch).pipe(
-        catchError(err => {
-          if (err.status === 422) return of(void 0); // Branch já existe, continua
-          results.errors?.push(`Erro ao criar branch em ${repo}: ${err.message}`);
-          return of(void 0);
+      return this.githubService.createBranch(owner, repo, branchName, preferredBaseBranch).pipe(
+        map((result) => result.actualBaseBranch), // Retorna a branch base real encontrada
+        catchError((err: any) => {
+          if (err.status === 404 && err.message?.includes('Nenhuma branch base válida')) {
+            results.errors?.push(`Erro em ${repo}: ${err.message}`);
+            return throwError(() => err);
+          }
+          // Outros erros ao criar branch
+          results.errors?.push(`Erro ao criar branch em ${repo}: ${err.message || err}`);
+          return throwError(() => err);
         }),
-        // 2. Cria um único commit com o documento e todos os scripts
-        switchMap(() => {
+        switchMap((actualBaseBranch: string) => {
+          // Usa a branch base real encontrada para o resto do processo
+          const baseBranch = actualBaseBranch;
+          
+          // 2. Cria um único commit com o documento e todos os scripts
           const markdown = this.releaseService.generateMarkdown(release);
           const demandId = release.demandId.trim();
           const filePath = `releases/release_${demandId}.md`;
@@ -102,10 +110,11 @@ export class VersioningService {
           }
           
           // Verifica quais scripts realmente precisam ser atualizados (não existem ou foram alterados)
+          // Verifica na branch feature/upsert-release onde os arquivos devem estar
           const scriptCheckOperations = scriptsWithContent.map(script => {
             const scriptName = script.name.trim();
             const scriptPath = `scripts/${demandId}/${scriptName}`;
-            return this.githubService.getFileContent(owner, repo, scriptPath, baseBranch).pipe(
+            return this.githubService.getFileContent(owner, repo, scriptPath, branchName).pipe(
               map((existingContent: string | null) => {
                 // Se o arquivo não existe ou o conteúdo é diferente, precisa ser adicionado/atualizado
                 if (!existingContent || existingContent !== script.content) {
@@ -121,6 +130,34 @@ export class VersioningService {
             );
           });
 
+          // Se não há scripts para verificar, pula direto para criar o commit
+          if (scriptCheckOperations.length === 0) {
+            const tryCreateCommit = (retryCount: number = 0): Observable<boolean> => {
+              return this.githubService.createSingleCommitWithMultipleFiles(
+                owner,
+                repo,
+                branchName,
+                message,
+                filesToCommit
+              ).pipe(
+                map(() => true),
+                catchError((err: any) => {
+                  if ((err.message?.includes('atualizada durante a operação') || err.status === 422) && retryCount < 2) {
+                    console.warn(`[versionRelease] Tentando novamente criar commit (tentativa ${retryCount + 1}/2)...`);
+                    return timer(1000 * (retryCount + 1)).pipe(
+                      switchMap(() => tryCreateCommit(retryCount + 1))
+                    );
+                  }
+                  results.errors?.push(`Erro ao criar commit em ${repo}: ${err.message || err}`);
+                  return of(false);
+                })
+              );
+            };
+            return tryCreateCommit().pipe(
+              map((commitCreated: boolean) => ({ commitCreated, baseBranch }))
+            );
+          }
+
           return forkJoin(scriptCheckOperations).pipe(
             switchMap((scriptChecks) => {
               // Adiciona apenas scripts que precisam ser atualizados
@@ -131,7 +168,7 @@ export class VersioningService {
               });
 
               // Cria um único commit com todos os arquivos (com retry para lidar com race conditions)
-              const tryCreateCommit = (retryCount: number = 0): Observable<void> => {
+              const tryCreateCommit = (retryCount: number = 0): Observable<boolean> => {
                 return this.githubService.createSingleCommitWithMultipleFiles(
                   owner,
                   repo,
@@ -139,6 +176,7 @@ export class VersioningService {
                   message,
                   filesToCommit
                 ).pipe(
+                  map(() => true), // Commit criado com sucesso
                   catchError((err: any) => {
                     // Se a branch foi atualizada durante a operação, tenta novamente (até 2 vezes)
                     if ((err.message?.includes('atualizada durante a operação') || err.status === 422) && retryCount < 2) {
@@ -148,17 +186,26 @@ export class VersioningService {
                       );
                     }
                     results.errors?.push(`Erro ao criar commit em ${repo}: ${err.message || err}`);
-                    return of(void 0);
+                    return of(false); // Commit não foi criado
                   })
                 );
               };
               
-              return tryCreateCommit();
+              return tryCreateCommit().pipe(
+                map((commitCreated: boolean) => ({ commitCreated, baseBranch }))
+              );
             })
           );
         }),
-        // 4. Cria o Pull Request da branch feature/upsert-release
-        switchMap(() => {
+        // 4. Verifica se o commit foi criado antes de tentar criar o PR
+        switchMap(({ commitCreated, baseBranch }: { commitCreated: boolean; baseBranch: string }) => {
+          if (!commitCreated) {
+            // Commit não foi criado, não tenta criar PR
+            results.errors?.push(`Não foi possível criar commit em ${repo}. PR não será criado.`);
+            return of({ repo, pr: null, success: false });
+          }
+
+          // 5. Cria o Pull Request da branch feature/upsert-release
           const demandId = release.demandId.trim();
           const prTitle = `Release ${demandId}: ${release.title || release.description}`;
           const prBody = this.generatePRBody(release);
@@ -172,10 +219,26 @@ export class VersioningService {
             }),
             catchError(err => {
               if (err.status === 422) {
-                results.errors?.push(`PR já existe para ${repo} - verifique manualmente`);
-                return of({ repo, pr: null, success: true });
+                // Melhora a mensagem de erro baseada no tipo de erro 422
+                let errorMessage = `Erro ao criar PR em ${repo}`;
+                
+                if (err.existingPR) {
+                  errorMessage = `PR já existe para ${repo} (#${err.existingPR.number}) - ${err.existingPR.html_url}`;
+                  // Se já existe PR, considera como sucesso parcial
+                  return of({ repo, pr: err.existingPR, success: true });
+                } else if (err.message?.includes('Não há diferenças') || err.message?.includes('No commits between')) {
+                  errorMessage = `Não há diferenças entre ${branchName} e ${baseBranch} em ${repo}. O commit pode não ter sido criado corretamente.`;
+                } else if (err.message?.includes('Já existe um PR')) {
+                  errorMessage = err.message;
+                  return of({ repo, pr: null, success: true });
+                } else {
+                  errorMessage = err.message || `Erro 422 ao criar PR em ${repo}`;
+                }
+                
+                results.errors?.push(errorMessage);
+                return of({ repo, pr: null, success: false });
               }
-              results.errors?.push(`Erro ao criar PR em ${repo}: ${err.message}`);
+              results.errors?.push(`Erro ao criar PR em ${repo}: ${err.message || err}`);
               return of({ repo, pr: null, success: false });
             })
           );
@@ -236,95 +299,138 @@ export class VersioningService {
       const { owner, repo: repoName } = repoInfo;
       const demandId = release.demandId.trim();
       const branchName = `feature/remove-release-${demandId}`;
-      const baseBranch = 'develop';
+      const preferredBaseBranch = 'develop';
       const releaseFilePath = `releases/release_${demandId}.md`;
 
-      // 1. Verifica se o arquivo existe no repositório
-      return this.githubService.getFileSha(owner, repoName, releaseFilePath, baseBranch).pipe(
-        switchMap((sha: string | null) => {
-          if (!sha) {
-            // Arquivo não existe neste repositório, pula
-            return of({ repo: repoName, success: true, pr: null });
-          }
+      // 1. Verifica se o arquivo existe no repositório (tenta encontrar branch base válida primeiro)
+      return this.githubService.findValidBaseBranch(owner, repoName, preferredBaseBranch).pipe(
+        switchMap((actualBaseBranch: string) => {
+          const baseBranch = actualBaseBranch;
+          return this.githubService.getFileSha(owner, repoName, releaseFilePath, baseBranch).pipe(
+            switchMap((sha: string | null) => {
+              if (!sha) {
+                // Arquivo não existe neste repositório, pula
+                return of({ repo: repoName, success: true, pr: null });
+              }
 
-          // 2. Cria a branch
-          return this.githubService.createBranch(owner, repoName, branchName, baseBranch).pipe(
-            catchError(err => {
-              if (err.status === 422) return of(void 0); // Branch já existe
-              results.errors?.push(`Erro ao criar branch em ${repoName}: ${err.message}`);
-              return of(void 0);
-            }),
-            // 3. Deleta o arquivo de release
-            switchMap(() => {
-              return this.githubService.deleteFile(owner, repoName, releaseFilePath, `docs: remove release ${demandId}`, branchName).pipe(
-                catchError(err => {
-                  results.errors?.push(`Erro ao deletar arquivo em ${repoName}: ${err.message}`);
-                  return of(void 0);
-                })
-              );
-            }),
-            // 4. Deleta os scripts relacionados se houver
-            switchMap(() => {
-              if (release.scripts.length === 0) return of(void 0);
+              // 2. Cria a branch
+              return this.githubService.createBranch(owner, repoName, branchName, baseBranch).pipe(
+                map((result) => ({ baseBranch: result.actualBaseBranch, sha })),
+                catchError((err: any) => {
+                  if (err.status === 404 && err.message?.includes('Nenhuma branch base válida')) {
+                    results.errors?.push(`Erro em ${repoName}: ${err.message}`);
+                    return throwError(() => err);
+                  }
+                  // Se erro ao criar branch, tenta descobrir a branch base válida
+                  return this.githubService.findValidBaseBranch(owner, repoName, baseBranch).pipe(
+                    map((actualBaseBranch) => ({ baseBranch: actualBaseBranch, sha })),
+                    catchError(() => {
+                      results.errors?.push(`Erro ao criar branch em ${repoName}: ${err.message || err}`);
+                      return throwError(() => err);
+                    })
+                  );
+                }),
+                switchMap(({ baseBranch: actualBase, sha: fileSha }) => {
+                  const baseBranch = actualBase;
+                  // 3. Deleta o arquivo de release
+                  return this.githubService.deleteFile(owner, repoName, releaseFilePath, `docs: remove release ${demandId}`, branchName).pipe(
+                    catchError((err: any) => {
+                      results.errors?.push(`Erro ao deletar arquivo em ${repoName}: ${err.message}`);
+                      return of(void 0);
+                    }),
+                    // 4. Deleta os scripts relacionados se houver
+                    switchMap(() => {
+                      if (release.scripts.length === 0) return of({ baseBranch });
 
-              const scriptOperations = release.scripts
-                .filter(script => script.name)
-                .map(script => {
-                  const demandId = release.demandId.trim();
-                  const scriptName = script.name.trim();
-                  const scriptPath = `scripts/${demandId}/${scriptName}`;
-                  return this.githubService.getFileSha(owner, repoName, scriptPath, baseBranch).pipe(
-                    switchMap((scriptSha: string | null) => {
-                      if (!scriptSha) {
-                        return of(void 0); // Script não existe, pula
-                      }
-                      return this.githubService.deleteFile(
-                        owner, 
-                        repoName, 
-                        scriptPath, 
-                        `docs: remove script ${scriptName} da release ${demandId}`, 
-                        branchName
-                      ).pipe(
-                        catchError(err => {
-                          console.warn(`Erro ao deletar script ${script.name} em ${repoName}:`, err);
-                          return of(void 0);
-                        })
+                      const scriptOperations = release.scripts
+                        .filter(script => script.name)
+                        .map(script => {
+                          const scriptName = script.name.trim();
+                          const scriptPath = `scripts/${demandId}/${scriptName}`;
+                          return this.githubService.getFileSha(owner, repoName, scriptPath, baseBranch).pipe(
+                            switchMap((scriptSha: string | null) => {
+                              if (!scriptSha) {
+                                return of(void 0); // Script não existe, pula
+                              }
+                              return this.githubService.deleteFile(
+                                owner, 
+                                repoName, 
+                                scriptPath, 
+                                `docs: remove script ${scriptName} da release ${demandId}`, 
+                                branchName
+                              ).pipe(
+                                catchError((err: any) => {
+                                  console.warn(`Erro ao deletar script ${script.name} em ${repoName}:`, err);
+                                  return of(void 0);
+                                })
+                              );
+                            })
+                          );
+                        });
+
+                      return forkJoin(scriptOperations.length > 0 ? scriptOperations : [of(void 0)]).pipe(
+                        map(() => ({ baseBranch }))
                       );
                     })
                   );
-                });
-
-              return forkJoin(scriptOperations.length > 0 ? scriptOperations : [of(void 0)]);
-            }),
-            // 5. Cria o Pull Request
-            switchMap(() => {
-              const demandId = release.demandId.trim();
-              const prTitle = `Remove Release ${demandId}`;
-              const prBody = this.generateDeletePRBody(release);
-
-              return this.githubService.createPullRequest({
-                owner, 
-                repo: repoName, 
-                title: prTitle, 
-                body: prBody, 
-                head: branchName, 
-                base: baseBranch
-              }).pipe(
-                map(pr => {
-                  results.prs.push({ repo: `${owner}/${repoName}`, url: pr.html_url, number: pr.number });
-                  return { repo: repoName, pr, success: true };
-                }),
-                catchError(err => {
-                  if (err.status === 422) {
-                    results.errors?.push(`PR já existe para ${repoName} - verifique manualmente`);
-                    return of({ repo: repoName, pr: null, success: true });
-                  }
-                  results.errors?.push(`Erro ao criar PR em ${repoName}: ${err.message}`);
-                  return of({ repo: repoName, pr: null, success: false });
                 })
               );
+            })
+          );
+        }),
+        // 5. Cria o Pull Request
+        switchMap((result: { repo?: string; success?: boolean; pr?: any; baseBranch?: string }) => {
+          // Se já retornou resultado (arquivo não existe), retorna direto
+          if (result.repo) {
+            return of(result as { repo: string; success: boolean; pr: any });
+          }
+          
+          if (!result.baseBranch) {
+            results.errors?.push(`Erro: branch base não encontrada em ${repoName}`);
+            return of({ repo: repoName, pr: null, success: false });
+          }
+          
+          const baseBranch = result.baseBranch;
+          const demandId = release.demandId.trim();
+          const prTitle = `Remove Release ${demandId}`;
+          const prBody = this.generateDeletePRBody(release);
+
+          return this.githubService.createPullRequest({
+            owner, 
+            repo: repoName, 
+            title: prTitle, 
+            body: prBody, 
+            head: branchName, 
+            base: baseBranch
+          }).pipe(
+            map(pr => {
+              results.prs.push({ repo: `${owner}/${repoName}`, url: pr.html_url, number: pr.number });
+              return { repo: repoName, pr, success: true };
             }),
-            catchError(() => of({ repo: repoName, pr: null, success: false }))
+            catchError((err: any) => {
+              if (err.status === 422) {
+                // Melhora a mensagem de erro baseada no tipo de erro 422
+                let errorMessage = `Erro ao criar PR em ${repoName}`;
+                
+                if (err.existingPR) {
+                  errorMessage = `PR já existe para ${repoName} (#${err.existingPR.number}) - ${err.existingPR.html_url}`;
+                  // Se já existe PR, considera como sucesso parcial
+                  return of({ repo: repoName, pr: err.existingPR, success: true });
+                } else if (err.message?.includes('Não há diferenças') || err.message?.includes('No commits between')) {
+                  errorMessage = `Não há diferenças entre ${branchName} e ${baseBranch} em ${repoName}. O commit pode não ter sido criado corretamente.`;
+                } else if (err.message?.includes('Já existe um PR')) {
+                  errorMessage = err.message;
+                  return of({ repo: repoName, pr: null, success: true });
+                } else {
+                  errorMessage = err.message || `Erro 422 ao criar PR em ${repoName}`;
+                }
+                
+                results.errors?.push(errorMessage);
+                return of({ repo: repoName, pr: null, success: false });
+              }
+              results.errors?.push(`Erro ao criar PR em ${repoName}: ${err.message || err}`);
+              return of({ repo: repoName, pr: null, success: false });
+            })
           );
         }),
         catchError(() => of({ repo: repoName, pr: null, success: false }))
@@ -357,7 +463,7 @@ export class VersioningService {
     const demandId = release.demandId.trim();
     body += `- \`releases/release_${demandId}.md\`\n`;
     if (release.scripts.length > 0) {
-      release.scripts.forEach(script => {
+      release.scripts.forEach((script: { name: string }) => {
         const scriptName = script.name.trim();
         body += `- \`scripts/${demandId}/${scriptName}\`\n`;
       });
@@ -372,7 +478,7 @@ export class VersioningService {
     body += `### Arquivos removidos\n`;
     body += `- \`releases/release_${demandId}.md\`\n`;
     if (release.scripts.length > 0) {
-      release.scripts.forEach(script => {
+      release.scripts.forEach((script: { name: string }) => {
         const scriptName = script.name.trim();
         body += `- \`scripts/${demandId}/${scriptName}\`\n`;
       });

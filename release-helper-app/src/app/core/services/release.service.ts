@@ -848,11 +848,18 @@ export class ReleaseService {
       }
 
       const { owner, repo: repoName } = repoInfo;
-      const baseBranch = 'develop';
+      const preferredBaseBranch = 'develop';
 
       // 1. Cria a branch feature/upsert-release se não existir
-      return this.githubService.createBranch(owner, repoName, this.UPSERT_BRANCH, baseBranch).pipe(
-        catchError(() => of(void 0)), // Branch já existe, continua
+      return this.githubService.createBranch(owner, repoName, this.UPSERT_BRANCH, preferredBaseBranch).pipe(
+        map(() => void 0 as void), // Ignora o resultado, continua
+        catchError((err) => {
+          if (err.status === 404 && err.message?.includes('Nenhuma branch base válida')) {
+            console.warn(`Erro ao criar branch em ${repoName}: ${err.message}`);
+            return of(void 0 as void); // Continua mesmo com erro
+          }
+          return of(void 0 as void); // Branch já existe ou outro erro, continua
+        }),
         // 2. Cria/atualiza o arquivo de release
         switchMap(() => {
           const markdown = this.generateMarkdown(release);

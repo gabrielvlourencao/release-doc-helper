@@ -509,42 +509,182 @@ export class GitHubService {
   }
 
   /**
-   * Cria uma branch a partir de uma branch base
+   * Obtém a branch padrão do repositório
    */
-  createBranch(owner: string, repo: string, branchName: string, baseBranch: string = 'develop'): Observable<void> {
+  getDefaultBranch(owner: string, repo: string): Observable<string> {
     const octokit = this.getOctokit();
     if (!octokit) {
       return throwError(() => new Error('Nenhum token disponível'));
     }
 
-    // Primeiro, obtém a referência da branch base
+    return from(
+      octokit.repos.get({
+        owner,
+        repo
+      })
+    ).pipe(
+      map(response => response.data.default_branch),
+      catchError((error: any) => {
+        console.error('Erro ao obter branch padrão:', error);
+        // Fallback para 'main' se não conseguir obter
+        return of('main');
+      })
+    );
+  }
+
+  /**
+   * Encontra uma branch base válida, tentando develop, main, master ou a branch padrão
+   */
+  findValidBaseBranch(owner: string, repo: string, preferredBranch: string = 'develop'): Observable<string> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    // Lista de branches para tentar, na ordem de preferência
+    const branchesToTry = [preferredBranch, 'main', 'master'];
+    
+    // Função recursiva para tentar cada branch
+    const tryBranch = (index: number): Observable<string> => {
+      if (index >= branchesToTry.length) {
+        // Se nenhuma branch comum funcionou, tenta obter a branch padrão do repositório
+        return this.getDefaultBranch(owner, repo).pipe(
+          switchMap(defaultBranch => {
+            if (branchesToTry.includes(defaultBranch)) {
+              // Já tentamos essa, retorna erro
+              return throwError(() => new Error(`Nenhuma branch base válida encontrada. Tentei: ${branchesToTry.join(', ')}, ${defaultBranch}`));
+            }
+            return from(
+              octokit.git.getRef({
+                owner,
+                repo,
+                ref: `heads/${defaultBranch}`
+              })
+            ).pipe(
+              map(() => defaultBranch),
+              catchError(() => throwError(() => new Error(`Nenhuma branch base válida encontrada. Tentei: ${branchesToTry.join(', ')}, ${defaultBranch}`)))
+            );
+          })
+        );
+      }
+
+      const branch = branchesToTry[index];
+      return from(
+        octokit.git.getRef({
+          owner,
+          repo,
+          ref: `heads/${branch}`
+        })
+      ).pipe(
+        map(() => branch),
+        catchError((error: any) => {
+          if (error.status === 404) {
+            // Branch não existe, tenta a próxima
+            return tryBranch(index + 1);
+          }
+          // Outro erro, propaga
+          return throwError(() => error);
+        })
+      );
+    };
+
+    return tryBranch(0);
+  }
+
+  /**
+   * Verifica se uma branch existe
+   */
+  branchExists(owner: string, repo: string, branchName: string): Observable<boolean> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
     return from(
       octokit.git.getRef({
         owner,
         repo,
-        ref: `heads/${baseBranch}`
+        ref: `heads/${branchName}`
       })
     ).pipe(
-      switchMap((baseRef: any) => {
-        const sha = baseRef.data.object.sha;
-        
-        // Cria a nova branch
-        return from(
-          octokit.git.createRef({
-            owner,
-            repo,
-            ref: `refs/heads/${branchName}`,
-            sha
+      map(() => true),
+      catchError((error: any) => {
+        if (error.status === 404) {
+          return of(false);
+        }
+        // Outro erro, assume que não existe
+        return of(false);
+      })
+    );
+  }
+
+  /**
+   * Cria uma branch a partir de uma branch base
+   * Se a branch base não existir, tenta encontrar uma válida automaticamente
+   * Se a branch já existir, retorna sucesso sem criar
+   */
+  createBranch(owner: string, repo: string, branchName: string, baseBranch: string = 'develop'): Observable<{ created: boolean; actualBaseBranch: string }> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    // Primeiro, encontra a branch base válida (faz isso uma vez só)
+    return this.findValidBaseBranch(owner, repo, baseBranch).pipe(
+      switchMap((actualBaseBranch: string) => {
+        // Verifica se a branch já existe
+        return this.branchExists(owner, repo, branchName).pipe(
+          switchMap((exists: boolean) => {
+            if (exists) {
+              // Branch já existe, retorna imediatamente
+              return of({ created: false, actualBaseBranch });
+            }
+
+            // Branch não existe, tenta criar
+            // Obtém a referência da branch base encontrada
+            return from(
+              octokit.git.getRef({
+                owner,
+                repo,
+                ref: `heads/${actualBaseBranch}`
+              })
+            ).pipe(
+              switchMap((baseRef: any) => {
+                const sha = baseRef.data.object.sha;
+                
+                // Cria a nova branch
+                return from(
+                  octokit.git.createRef({
+                    owner,
+                    repo,
+                    ref: `refs/heads/${branchName}`,
+                    sha
+                  })
+                ).pipe(
+                  map(() => ({ created: true, actualBaseBranch })),
+                  catchError((error: any) => {
+                    // Se a branch já existe (pode ter sido criada entre a verificação e a criação), não é um erro
+                    if (error.status === 422) {
+                      return of({ created: false, actualBaseBranch });
+                    }
+                    console.error('Erro ao criar branch:', error);
+                    return throwError(() => error);
+                  })
+                );
+              })
+            );
           })
         );
       }),
-      map(() => void 0 as void),
       catchError((error: any) => {
-        // Se a branch já existe, não é um erro
-        if (error.status === 422) {
-          return of(void 0);
+        // Se não conseguiu encontrar branch base válida, retorna erro mais claro
+        if (error.message?.includes('Nenhuma branch base válida encontrada')) {
+          return throwError(() => ({
+            status: 404,
+            message: `Não foi possível encontrar uma branch base válida no repositório ${owner}/${repo}. Verifique se o repositório tem pelo menos uma das branches: develop, main, master ou a branch padrão configurada.`,
+            originalError: error
+          }));
         }
-        console.error('Erro ao criar branch:', error);
         return throwError(() => error);
       })
     );
@@ -587,23 +727,77 @@ export class GitHubService {
       return throwError(() => new Error('Nenhum token disponível'));
     }
 
-    return from(
-      octokit.pulls.create({
-        owner: params.owner,
-        repo: params.repo,
-        title: params.title,
-        body: params.body,
-        head: params.head,
-        base: params.base
-      })
-    ).pipe(
-      map(response => ({
-        html_url: response.data.html_url,
-        number: response.data.number
-      })),
-      catchError(error => {
-        console.error('Erro ao criar Pull Request:', error);
-        return throwError(() => error);
+    // Validações básicas
+    if (!params.title || params.title.trim().length === 0) {
+      return throwError(() => new Error('O título do PR não pode estar vazio'));
+    }
+
+    if (!params.body || params.body.trim().length === 0) {
+      return throwError(() => new Error('O corpo do PR não pode estar vazio'));
+    }
+
+    // Verifica se já existe um PR entre essas branches
+    return this.getExistingPR(params.owner, params.repo, params.head, params.base).pipe(
+      switchMap(existingPR => {
+        if (existingPR) {
+          return throwError(() => ({
+            status: 422,
+            message: `Já existe um PR aberto (#${existingPR.number}) entre ${params.head} e ${params.base}`,
+            existingPR
+          }));
+        }
+
+        // Verifica se há diferenças entre as branches
+        return this.hasBranchDifferences(params.owner, params.repo, params.head, params.base).pipe(
+          switchMap(hasDifferences => {
+            if (!hasDifferences) {
+              return throwError(() => ({
+                status: 422,
+                message: `Não há diferenças entre a branch ${params.head} e ${params.base}. Não é possível criar um PR sem commits.`
+              }));
+            }
+
+            // Cria o PR
+            return from(
+              octokit.pulls.create({
+                owner: params.owner,
+                repo: params.repo,
+                title: params.title.trim(),
+                body: params.body.trim(),
+                head: params.head,
+                base: params.base
+              })
+            ).pipe(
+              map(response => ({
+                html_url: response.data.html_url,
+                number: response.data.number
+              })),
+              catchError(error => {
+                console.error('Erro ao criar Pull Request:', error);
+                
+                // Melhora a mensagem de erro para 422
+                if (error.status === 422) {
+                  const errorMessage = error.response?.data?.message || error.message || 'Erro ao criar PR';
+                  let userMessage = errorMessage;
+                  
+                  if (errorMessage.includes('No commits between')) {
+                    userMessage = `Não há commits entre ${params.head} e ${params.base}. A branch precisa ter commits diferentes da base.`;
+                  } else if (errorMessage.includes('A pull request already exists')) {
+                    userMessage = `Já existe um PR aberto entre ${params.head} e ${params.base}`;
+                  }
+                  
+                  return throwError(() => ({
+                    ...error,
+                    status: 422,
+                    message: userMessage
+                  }));
+                }
+                
+                return throwError(() => error);
+              })
+            );
+          })
+        );
       })
     );
   }
@@ -1139,6 +1333,73 @@ export class GitHubService {
   countCommitsNotInDevelop(owner: string, repo: string, branch: string): Observable<number> {
     return this.listCommitsNotInDevelop(owner, repo, branch, 100).pipe(
       map(commits => commits.length)
+    );
+  }
+
+  /**
+   * Verifica se há diferenças entre duas branches (se a head tem commits que não estão na base)
+   */
+  hasBranchDifferences(owner: string, repo: string, head: string, base: string): Observable<boolean> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    return from(
+      octokit.repos.compareCommits({
+        owner,
+        repo,
+        base,
+        head
+      })
+    ).pipe(
+      map(response => {
+        // Se há commits à frente (ahead > 0), há diferenças
+        return response.data.ahead_by > 0;
+      }),
+      catchError((error: any) => {
+        // Se a branch não existe ou há outro erro, retorna false
+        if (error.status === 404) {
+          return of(false);
+        }
+        console.error('Erro ao comparar branches:', error);
+        return of(false);
+      })
+    );
+  }
+
+  /**
+   * Verifica se já existe um PR aberto entre as branches especificadas
+   */
+  getExistingPR(owner: string, repo: string, head: string, base: string): Observable<{ number: number; html_url: string } | null> {
+    const octokit = this.getOctokit();
+    if (!octokit) {
+      return throwError(() => new Error('Nenhum token disponível'));
+    }
+
+    return from(
+      octokit.pulls.list({
+        owner,
+        repo,
+        state: 'open',
+        head: `${owner}:${head}`,
+        base
+      })
+    ).pipe(
+      map(response => {
+        const prs = response.data;
+        if (prs.length > 0) {
+          return {
+            number: prs[0].number,
+            html_url: prs[0].html_url
+          };
+        }
+        return null;
+      }),
+      catchError((error: any) => {
+        console.error('Erro ao verificar PRs existentes:', error);
+        return of(null);
+      })
     );
   }
 
