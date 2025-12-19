@@ -17,7 +17,8 @@ export class ExportService {
    */
   exportAsMarkdown(release: Release): void {
     const markdown = this.releaseService.generateMarkdown(release);
-    this.downloadFile(markdown, `release_${release.demandId}.md`, 'text/markdown');
+    const demandId = release.demandId.trim();
+    this.downloadFile(markdown, `release_${demandId}.md`, 'text/markdown');
   }
 
   /**
@@ -216,11 +217,15 @@ export class ExportService {
     addSection('4. Scripts Necessários');
     if (release.scripts.length > 0) {
       const scriptsHeaders = ['Script', 'Caminho (Path)', 'CHG'];
-      const scriptsRows = release.scripts.map(script => [
-        script.name || '-',
-        `scripts/${release.demandId}/${script.name}`,
-        script.changeId || '-'
-      ]);
+      const demandId = release.demandId.trim();
+      const scriptsRows = release.scripts.map(script => {
+        const scriptName = script.name.trim();
+        return [
+          scriptName || '-',
+          `scripts/${demandId}/${scriptName}`,
+          script.changeId || '-'
+        ];
+      });
       addTable(scriptsHeaders, scriptsRows, [30, 50, 20]);
     } else {
       addText('Nenhum script necessário.', 10, false);
@@ -263,7 +268,8 @@ export class ExportService {
     }
 
     // Salvar
-    doc.save(`release_${release.demandId}.pdf`);
+    const demandId = release.demandId.trim();
+    doc.save(`release_${demandId}.pdf`);
   }
 
   /**
@@ -276,9 +282,10 @@ export class ExportService {
     const markdown = this.releaseService.generateMarkdown(release);
     
     // Estrutura: releases/release_DMND.md
+    const demandId = release.demandId.trim();
     this.downloadFile(
       markdown, 
-      `release_${release.demandId}.md`, 
+      `release_${demandId}.md`, 
       'text/markdown'
     );
 

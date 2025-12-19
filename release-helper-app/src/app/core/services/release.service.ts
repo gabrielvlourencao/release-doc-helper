@@ -140,8 +140,17 @@ export class ReleaseService {
         
         // Cria nova release
         const currentUser = this.getCurrentUserLogin();
-        const newRelease: Release = {
+        // Garante que demandId e nomes de scripts sejam trimados
+        const trimmedRelease = {
           ...release,
+          demandId: release.demandId.trim(),
+          scripts: release.scripts?.map(script => ({
+            ...script,
+            name: script.name.trim()
+          })) || []
+        };
+        const newRelease: Release = {
+          ...trimmedRelease,
           id: this.generateId(),
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -207,9 +216,21 @@ export class ReleaseService {
           (changes.observations !== undefined && changes.observations !== release.observations) ||
           (changes.repositories !== undefined && JSON.stringify(changes.repositories) !== JSON.stringify(release.repositories));
         
+        // Garante que demandId e nomes de scripts sejam trimados
+        const trimmedChanges: Partial<Release> = { ...changes };
+        if (trimmedChanges.demandId) {
+          trimmedChanges.demandId = trimmedChanges.demandId.trim();
+        }
+        if (trimmedChanges.scripts) {
+          trimmedChanges.scripts = trimmedChanges.scripts.map(script => ({
+            ...script,
+            name: script.name.trim()
+          }));
+        }
+        
         const updatedRelease: Release = {
           ...release,
-          ...changes,
+          ...trimmedChanges,
           id,
           updatedAt: new Date(),
           updatedBy: currentUser || release.updatedBy,
@@ -315,7 +336,9 @@ export class ReleaseService {
       md += `| Script | Caminho (Path) | CHG |\n`;
       md += `|--------|----------------|-----|\n`;
       release.scripts.forEach(s => {
-        md += `| ${s.name} | \`scripts/${release.demandId}/${s.name}\` | ${s.changeId || '-'} |\n`;
+        const demandId = release.demandId.trim();
+        const scriptName = s.name.trim();
+        md += `| ${scriptName} | \`scripts/${demandId}/${scriptName}\` | ${s.changeId || '-'} |\n`;
       });
     } else {
       md += `Nenhum script necessário.\n`;
@@ -338,7 +361,7 @@ export class ReleaseService {
     }
 
     md += `---\n`;
-    md += `*Documento gerado em ${new Date().toLocaleDateString('pt-BR')} às ${new Date().toLocaleTimeString('pt-BR')}*\n`;
+    md += `*Documento ATUALIZADO EM ${new Date().toLocaleDateString('pt-BR')} às ${new Date().toLocaleTimeString('pt-BR')}*\n`;
 
     return md;
   }
@@ -355,8 +378,9 @@ export class ReleaseService {
       const files: VersionedFile[] = [];
 
       // Arquivo markdown da release
+      const demandId = release.demandId.trim();
       files.push({
-        path: `releases/release_${release.demandId}.md`,
+        path: `releases/release_${demandId}.md`,
         content: this.generateMarkdown(release),
         type: 'markdown'
       });
@@ -364,8 +388,10 @@ export class ReleaseService {
       // Scripts relacionados ao repositório
       release.scripts.forEach(script => {
         if (script.content) {
+          const demandId = release.demandId.trim();
+          const scriptName = script.name.trim();
           files.push({
-            path: `scripts/${release.demandId}/${script.name}`,
+            path: `scripts/${demandId}/${scriptName}`,
             content: script.content,
             type: 'script'
           });
@@ -552,7 +578,7 @@ export class ReleaseService {
         }
       }
       
-      if (currentSection === 'observations' && line && !line.startsWith('#') && !line.startsWith('---') && !line.startsWith('*Documento gerado')) {
+      if (currentSection === 'observations' && line && !line.startsWith('#') && !line.startsWith('---') && !line.startsWith('*Documento gerado') && !line.startsWith('*Documento ATUALIZADO')) {
         observations += (observations ? '\n' : '') + line;
       }
     }
@@ -705,7 +731,9 @@ export class ReleaseService {
         }
         // Se não tem path explícito, constrói baseado no nome
         if (!scriptPath || scriptPath === '-' || scriptPath === '') {
-          scriptPath = `scripts/${demandId}/${scriptName}`;
+          const demandIdTrimmed = demandId.trim();
+          const scriptNameTrimmed = scriptName.trim();
+          scriptPath = `scripts/${demandIdTrimmed}/${scriptNameTrimmed}`;
         }
         
         const changeId = cols.length >= 3 ? (cols[2] === '-' ? '' : cols[2]) : '';
@@ -743,7 +771,7 @@ export class ReleaseService {
           const trimmed = line.trim();
           // Remove linhas vazias no início/fim, separadores e metadados
           return trimmed && 
-                 !trimmed.startsWith('*Documento gerado') &&
+                 !trimmed.startsWith('*Documento gerado') && !trimmed.startsWith('*Documento ATUALIZADO') &&
                  !trimmed.startsWith('---') &&
                  !trimmed.match(/^[-*_]{3,}$/); // Remove separadores de markdown
         })
@@ -828,10 +856,11 @@ export class ReleaseService {
         // 2. Cria/atualiza o arquivo de release
         switchMap(() => {
           const markdown = this.generateMarkdown(release);
-          const filePath = `releases/release_${release.demandId}.md`;
+          const demandId = release.demandId.trim();
+          const filePath = `releases/release_${demandId}.md`;
           const message = action === 'create' 
-            ? `docs: cria release ${release.demandId}`
-            : `docs: atualiza release ${release.demandId}`;
+            ? `docs: cria release ${demandId}`
+            : `docs: atualiza release ${demandId}`;
 
           return this.githubService.createOrUpdateFile(owner, repoName, filePath, markdown, message, this.UPSERT_BRANCH).pipe(
             catchError(err => {
@@ -849,7 +878,8 @@ export class ReleaseService {
 
           // Se tem múltiplos scripts, agrupa em um único commit
           if (scriptsToUpdate.length > 1) {
-            const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} ${scriptsToUpdate.length} scripts para release ${release.demandId}`;
+            const demandId = release.demandId.trim();
+            const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} ${scriptsToUpdate.length} scripts para release ${demandId}`;
             
             // Para agrupar, precisamos fazer commits sequenciais na mesma branch
             // O GitHub API não suporta múltiplos arquivos em um único commit diretamente
@@ -858,11 +888,12 @@ export class ReleaseService {
             let scriptChain$: Observable<void> = of(void 0);
             
             scriptsToUpdate.forEach((script) => {
-              const scriptPath = `scripts/${release.demandId}/${script.name}`;
+              const scriptName = script.name.trim();
+              const scriptPath = `scripts/${demandId}/${scriptName}`;
               scriptChain$ = scriptChain$.pipe(
                 switchMap(() => this.githubService.createOrUpdateFile(owner, repoName, scriptPath, script.content!, message, this.UPSERT_BRANCH).pipe(
                   catchError(err => {
-                    console.warn(`Erro ao criar/atualizar script ${script.name} em ${repoName}:`, err);
+                    console.warn(`Erro ao criar/atualizar script ${scriptName} em ${repoName}:`, err);
                     return of(void 0);
                   }),
                   map(() => void 0 as void)
@@ -874,12 +905,14 @@ export class ReleaseService {
           } else {
             // Apenas um script, cria commit individual
             const script = scriptsToUpdate[0];
-              const scriptPath = `scripts/${release.demandId}/${script.name}`;
-              const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} script ${script.name} para release ${release.demandId}`;
+              const demandId = release.demandId.trim();
+              const scriptName = script.name.trim();
+              const scriptPath = `scripts/${demandId}/${scriptName}`;
+              const message = `docs: ${action === 'create' ? 'adiciona' : 'atualiza'} script ${scriptName} para release ${demandId}`;
 
               return this.githubService.createOrUpdateFile(owner, repoName, scriptPath, script.content!, message, this.UPSERT_BRANCH).pipe(
                 catchError(err => {
-                  console.warn(`Erro ao criar/atualizar script ${script.name} em ${repoName}:`, err);
+                  console.warn(`Erro ao criar/atualizar script ${scriptName} em ${repoName}:`, err);
                   return of(void 0);
                 })
               );
@@ -919,7 +952,8 @@ export class ReleaseService {
         return of(false);
       }
 
-      const releaseFilePath = `releases/release_${release.demandId}.md`;
+      const demandId = release.demandId.trim();
+      const releaseFilePath = `releases/release_${demandId}.md`;
       return this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, releaseFilePath, 'develop').pipe(
         map((sha: string | null) => sha !== null),
         catchError(() => of(false))
@@ -956,7 +990,8 @@ export class ReleaseService {
       }
 
       const { owner, repo: repoName } = repoInfo;
-      const releaseFilePath = `releases/release_${release.demandId}.md`;
+      const demandId = release.demandId.trim();
+      const releaseFilePath = `releases/release_${demandId}.md`;
 
       // Desfaz o último commit do arquivo de release
       // Por enquanto, reverte apenas o arquivo de release para evitar múltiplos commits

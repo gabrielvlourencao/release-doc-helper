@@ -152,7 +152,9 @@ export class SyncService {
                       const scriptOperations = validScripts.map(script => {
                         // Busca da pasta scripts/${demandId}/ apenas para scripts que estão no markdown
                         // O script.name vem do parse da tabela de scripts do .md
-                        const scriptPath = `scripts/${demandId}/${script.name}`;
+                        const demandIdTrimmed = demandId.trim();
+                        const scriptName = script.name.trim();
+                        const scriptPath = `scripts/${demandIdTrimmed}/${scriptName}`;
                         return this.githubService.getFileContent(repoInfo.owner, repoInfo.repo, scriptPath, branch).pipe(
                         map((scriptContent: string | null) => {
                           if (scriptContent) {
@@ -251,7 +253,8 @@ export class SyncService {
                             return of(false);
                           }
 
-                          const filePath = `releases/release_${release.demandId}.md`;
+                          const demandId = release.demandId.trim();
+                          const filePath = `releases/release_${demandId}.md`;
                           return forkJoin([
                             this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, filePath, 'feature/upsert-release'),
                             this.githubService.getFileSha(repoInfo.owner, repoInfo.repo, filePath, 'develop')
@@ -658,7 +661,9 @@ export class SyncService {
                   const scriptOperations = validScripts.map(script => {
                     // Busca da pasta scripts/${demandId}/ apenas para scripts que estão no markdown
                     // O script.name vem do parse da tabela de scripts do .md
-                    const scriptPath = `scripts/${demandIdUpper}/${script.name}`;
+                    const demandIdTrimmed = demandIdUpper.trim();
+                    const scriptName = script.name.trim();
+                    const scriptPath = `scripts/${demandIdTrimmed}/${scriptName}`;
                     return this.githubService.getFileContent(repoInfo.owner, repoInfo.repo, scriptPath, result.branch).pipe(
                     map((scriptContent: string | null) => {
                       if (scriptContent) {

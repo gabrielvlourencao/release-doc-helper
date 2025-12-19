@@ -149,12 +149,14 @@ export class ImportService {
     tableLines.forEach((line, index) => {
       const cols = line.split('|').map(c => c.trim()).filter(c => c);
       if (cols.length >= 2 && cols[0] !== 'Nenhum') {
+        const demandIdTrimmed = demandId.trim();
+        const scriptName = cols[0].trim();
         scripts.push({
           id: `script-${Date.now()}-${index}`,
-          name: cols[0],
-          path: `scripts/${demandId}/${cols[0]}`,
+          name: scriptName,
+          path: `scripts/${demandIdTrimmed}/${scriptName}`,
           content: '',
-          changeId: cols.length >= 3 && cols[2] !== '-' ? cols[2] : ''
+          changeId: cols.length >= 3 && cols[2] !== '-' ? cols[2].trim() : ''
         });
       }
     });

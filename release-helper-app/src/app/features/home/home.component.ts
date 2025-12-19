@@ -343,7 +343,7 @@ import { ReleaseService, SyncService, GitHubService, NotificationService, LocalS
 | org/api-gateway                 | Nova rota          | develop   |
 
 ---
-<span class="text-slate-500">*Documento gerado em 05/12/2024 às 14:30*</span></pre>
+<span class="text-slate-500">*Documento ATUALIZADO EM 05/12/2024 às 14:30*</span></pre>
               </div>
             </div>
           </div>
