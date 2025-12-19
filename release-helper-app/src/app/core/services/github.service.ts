@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
 import { Observable, from, throwError, of, forkJoin, timer } from 'rxjs';
-import { map, catchError, switchMap, tap } from 'rxjs/operators';
+import { map, catchError, switchMap } from 'rxjs/operators';
 import { Octokit } from '@octokit/rest';
 import { GitHubAuthService } from './github-auth.service';
 
@@ -975,7 +975,7 @@ export class GitHubService {
     console.log(`[GitHubService] 🔍 Buscando conteúdo mais recente de ${path} na branch ${branch} do repositório ${owner}/${repo}`);
     // Busca do HEAD da branch (sempre o conteúdo mais recente)
     return this.getFileContent(owner, repo, path, branch).pipe(
-      tap(content => {
+      map((content: string | null) => {
         if (content) {
           console.log(`[GitHubService] ✅ Conteúdo encontrado na branch ${branch}: ${content.length} caracteres`);
           // Log das primeiras linhas para debug
@@ -998,6 +998,7 @@ export class GitHubService {
         } else {
           console.warn(`[GitHubService] ⚠️ Conteúdo vazio para ${path} na branch ${branch}`);
         }
+        return content;
       }),
       catchError(error => {
         console.error(`[GitHubService] ❌ Erro ao buscar conteúdo de ${path} na branch ${branch}:`, {
@@ -1234,104 +1235,6 @@ export class GitHubService {
    */
   countDocsCommits(owner: string, repo: string, branch: string): Observable<number> {
     return this.listBranchCommits(owner, repo, branch, 100).pipe(
-      map(commits => commits.length)
-    );
-  }
-
-  /**
-   * Lista commits docs: de uma branch que NÃO existem na develop
-   * Retorna apenas commits que estão na branch mas não na develop
-   */
-  listCommitsNotInDevelop(owner: string, repo: string, branch: string, perPage: number = 100): Observable<Array<{ sha: string; message: string; author: string; date: Date; url: string }>> {
-    const octokit = this.getOctokit();
-    if (!octokit) {
-      return throwError(() => new Error('Nenhum token disponível'));
-    }
-
-    // Busca commits docs: de ambas as branches com SHA completo
-    const branchCommits$ = from(
-      octokit.repos.listCommits({
-        owner,
-        repo,
-        sha: branch,
-        per_page: perPage
-      })
-    ).pipe(
-      map((response: any) => {
-        return response.data
-          .map((commit: any) => ({
-            sha: commit.sha, // SHA completo
-            shaShort: commit.sha.substring(0, 7), // SHA curto para exibição
-            message: commit.commit.message.split('\n')[0],
-            author: commit.author?.login || commit.commit?.author?.name || 'Unknown',
-            date: new Date(commit.commit.author.date),
-            url: commit.html_url
-          }))
-          .filter((commit: { message: string }) => commit.message.toLowerCase().startsWith('docs:'));
-      }),
-      catchError((error: any) => {
-        if (error.status === 404) {
-          return of([]);
-        }
-        console.error('Erro ao listar commits da branch:', error);
-        return of([]);
-      })
-    );
-
-    const developCommits$ = from(
-      octokit.repos.listCommits({
-        owner,
-        repo,
-        sha: 'develop',
-        per_page: perPage
-      })
-    ).pipe(
-      map((response: any) => {
-        // Filtra apenas commits docs: e retorna apenas os SHAs completos
-        return response.data
-          .filter((commit: any) => {
-            const message = commit.commit.message.split('\n')[0];
-            return message.toLowerCase().startsWith('docs:');
-          })
-          .map((commit: any) => commit.sha); // Apenas SHA completo para comparação
-      }),
-      catchError((error: any) => {
-        if (error.status === 404) {
-          return of([]);
-        }
-        console.error('Erro ao listar commits da develop:', error);
-        return of([]);
-      })
-    );
-
-    return forkJoin([branchCommits$, developCommits$]).pipe(
-      map(([branchCommits, developShas]) => {
-        // Cria um Set com os SHAs completos dos commits da develop para busca rápida
-        const developShasSet = new Set(developShas);
-        
-        // Filtra apenas commits da branch que não estão na develop
-        return branchCommits
-          .filter((commit: { sha: string; shaShort: string; message: string; author: string; date: Date; url: string }) => !developShasSet.has(commit.sha))
-          .map((commit: { sha: string; shaShort: string; message: string; author: string; date: Date; url: string }) => ({
-            sha: commit.shaShort, // Retorna SHA curto para exibição
-            message: commit.message,
-            author: commit.author,
-            date: commit.date,
-            url: commit.url
-          }));
-      }),
-      catchError((error: any) => {
-        console.error('Erro ao comparar commits entre branches:', error);
-        return of([]);
-      })
-    );
-  }
-
-  /**
-   * Conta commits docs: de uma branch que NÃO existem na develop
-   */
-  countCommitsNotInDevelop(owner: string, repo: string, branch: string): Observable<number> {
-    return this.listCommitsNotInDevelop(owner, repo, branch, 100).pipe(
       map(commits => commits.length)
     );
   }

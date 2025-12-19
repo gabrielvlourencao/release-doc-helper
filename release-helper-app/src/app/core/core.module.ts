@@ -1,6 +1,6 @@
 import { NgModule, Optional, SkipSelf } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { ReleaseService, NotificationService, ExportService, FirebaseService } from './services';
+import { ReleaseService, NotificationService, ExportService } from './services';
 
 /**
  * CoreModule - Módulo para serviços singleton
@@ -10,7 +10,6 @@ import { ReleaseService, NotificationService, ExportService, FirebaseService } f
   declarations: [],
   imports: [CommonModule],
   providers: [
-    FirebaseService,
     ReleaseService,
     NotificationService,
     ExportService
